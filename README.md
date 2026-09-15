@@ -20,6 +20,36 @@ This version is not ready for production use or customer installation.
 Customer/contact relationships, tracked improvement actions, final import tools, and a complete template package remain planned.
 See the [roadmap](docs/roadmap.md) and [product specification](docs/product-contract.md).
 
+## Screenshots
+
+These captures show the current application running locally with synthetic records for the fictional Harbor Community Network.
+Google Sheets, Docs, identity, and email are simulated in this demonstration; the images do not represent a qualified Google Workspace installation.
+
+### Performance at a glance
+
+See monthly results, targets, missing numbers, and goals that need attention across sites.
+
+![Performance dashboard with monthly goal trends and status indicators](assets/gallery/performance.png)
+
+### Work intake
+
+Search and filter requests, then open a record or create a new request for an assigned site.
+
+![Intake page showing a synthetic request and search and status filters](assets/gallery/intake.png)
+
+### Goal detail and guidance
+
+Compare a result with its target, review reporting history, and read the operating guidance associated with the current status.
+
+![Goal detail with trend, reporting history, and matching playbook guidance](assets/gallery/goal-detail.png)
+
+### Operating playbook
+
+Review maintained guidance by metric and status, including site-specific instructions.
+The local demonstration uses a simulated document; live document access and notifications still require Google qualification.
+
+![Playbook showing document health and organized guidance sections](assets/gallery/playbook.png)
+
 ## Run locally
 
 Use Node.js 22.13 or later and npm.
