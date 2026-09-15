@@ -1,0 +1,34 @@
+{
+  "templateVersion": 1,
+  "status": "specifications-only-not-provisioned",
+  "forms": [
+    {
+      "id": "internal-service-request",
+      "audience": "Approved internal Workspace users",
+      "responseSummary": false,
+      "fileUploads": false,
+      "destination": "Separate restricted staging spreadsheet",
+      "fields": [
+        {"key":"title","label":"Request title","required":true,"maxLength":200},
+        {"key":"site","label":"Team or site","required":true,"type":"approved-choice"},
+        {"key":"description","label":"What needs to happen?","required":true,"maxLength":2000},
+        {"key":"targetDate","label":"Requested date","required":false,"type":"date"},
+        {"key":"businessEmail","label":"Business email","required":true,"type":"email"}
+      ],
+      "promotion": "Validate current identity, site access and fields; deduplicate by immutable response ID; review before creating operational work"
+    },
+    {
+      "id": "public-business-inquiry",
+      "audience": "Public only after explicit publication approval",
+      "responseSummary": false,
+      "fileUploads": false,
+      "destination": "Separate restricted staging spreadsheet",
+      "fields": [
+        {"key":"company","label":"Business name","required":true,"maxLength":200},
+        {"key":"businessEmail","label":"Business email","required":true,"type":"email"},
+        {"key":"description","label":"What business process needs help?","required":true,"maxLength":2000}
+      ],
+      "promotion": "Treat all responses as untrusted; administrator reviews spam, duplicates and permitted content before assigning a site and creating a customer or request"
+    }
+  ]
+}

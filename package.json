@@ -1,0 +1,18 @@
+{
+  "name": "plumb",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "test": "node tests/run.js && node tests/performance.js && node tests/preview-parity.js && node tests/history-parts.js && node tests/guidance.js && node tests/integration.js && node tests/static.js && node tests/security.js && node tests/security-content.js && node tests/recovery.js && node tests/guidance-snapshot.js && node tests/access-recovery.js && node tests/intake-recovery.js && node tests/performance-recovery.js && node tests/ui-recovery.js && node tests/site-recovery.js && node tests/recovery-admin.js && node tests/client-retry.js",
+    "test:browser": "node tests/browser.js && node tests/browser-performance.js && node tests/browser-improve.js && node tests/browser-recovery.js",
+    "verify": "npm test && npm run test:browser",
+    "demo": "node tests/emulator.js"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1"
+  }
+}

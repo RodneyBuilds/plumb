@@ -1,0 +1,357 @@
+<script>
+'use strict';
+var BOOT = null, CURRENT = 'home', INTAKE = [], CURRENT_ITEM = null, ADMIN = { sites: [], people: [], roles: [], units: [] };
+
+function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function truthyClient_(value) { return value === true || String(value).toUpperCase() === 'TRUE'; }
+function runOnce_(action, payload) { return new Promise(function (resolve) { google.script.run.withSuccessHandler(resolve).withFailureHandler(function () { resolve({ ok: false, code: 'E_NETWORK', error: 'The connection to Google failed. Keep this form open and retry the same change.' }); }).api({ action: action, payload: payload || {} }); }); }
+/* A thin bar at the top of the page shows whenever the app is waiting on the
+   server, so a slow round trip never looks like nothing is happening. It counts
+   requests in flight, waits 140ms before showing so quick calls never flash,
+   and stays up at least 300ms once shown so it never flickers. Every server
+   call goes through run(), so instrumenting it here covers the whole app. */
+var NET_PENDING = 0, NET_SHOW_T = null, NET_HIDE_T = null, NET_SHOWN_AT = 0;
+var PENDING_MUTATION = null, MUTATION_IN_FLIGHT = false;
+var RECOVERABLE_ACTIONS = ['intake.save','intake.transition','access.save','access.scope.save','site.save','metric.save','metric.retire','goal.save','goal.retire','actual.saveMonth','actual.correct'];
+function pendingValuesHtml_(value) {
+  if (Array.isArray(value)) { return '<ol>' + value.map(function(item) { return '<li>' + pendingValuesHtml_(item) + '</li>'; }).join('') + '</ol>'; }
+  if (value && typeof value === 'object') {
+    return '<dl class="detail-list">' + Object.keys(value).filter(function(key) { return !/^(id|submissionKey|operationKey|version|updatedAt|originalSite)$/.test(key); }).map(function(key) {
+      var content = value[key], label = key.replace(/([a-z])([A-Z])/g,'$1 $2');
+      if (/Id$/.test(key)) {
+        if (!content) { return ''; }
+        var records = key === 'scopeId' ? ADMIN.units : typeof PERF !== 'undefined' && key === 'goalId' && PERF.entry ? PERF.entry.bands : [];
+        var record = (records || []).filter(function(item) { return item.unitId === content || item.goalId === content; })[0];
+        content = record ? record.name || record.metricName || 'Selected record' : 'Selected record'; label = label.replace(/ Id$/,'');
+      }
+      return '<div><dt>' + esc(label.charAt(0).toUpperCase()+label.slice(1)) + '</dt><dd>' + pendingValuesHtml_(content) + '</dd></div>';
+    }).join('') + '</dl>';
+  }
+  return esc(value === '' || value === null || value === undefined ? 'Not set' : value === true ? 'Yes' : value === false ? 'No' : value);
+}
+function showPendingMutation_() {
+  if (!PENDING_MUTATION) { return; }
+  var panel = document.getElementById('pendingMutation');
+  if (!panel) { panel = document.createElement('section'); panel.id = 'pendingMutation'; panel.className = 'card pad-lg recovery-panel'; panel.setAttribute('role','alert'); document.body.appendChild(panel); }
+  panel.innerHTML = '<h2>A save needs recovery</h2><p>Keep this page open. Retry submits the original change shown below. Later edits are not included. New saves are paused until this is resolved.</p><details><summary>Review the original change</summary><div id="pendingMutationValues" tabindex="0" aria-label="Original submitted values"></div></details><button class="btn btn-primary" id="retryOriginalButton" type="button" onclick="retryPendingMutation_()">Retry original change</button><p id="pendingMutationResult"></p>';
+  var visible = {};
+  Object.keys(PENDING_MUTATION.payload).forEach(function(key) { if (!/^(submissionKey|operationKey|version)$/.test(key)) { visible[key] = PENDING_MUTATION.payload[key]; } });
+  document.getElementById('pendingMutationValues').innerHTML = pendingValuesHtml_(visible);
+}
+function retryPendingMutation_() {
+  var original = PENDING_MUTATION;
+  if (!original || MUTATION_IN_FLIGHT) { return; }
+  var button = document.getElementById('retryOriginalButton'); if (button) { button.disabled = true; button.textContent = 'Retrying original change...'; }
+  return run(original.action,original.payload,true).then(function(result) {
+    if (result.ok) {
+      closeDialog(); toast('Original change saved. Later form edits were not submitted.');
+      if (original.action.indexOf('intake.') === 0 && result.item) { openIntake(result.item.id); } else { go(CURRENT); }
+    } else {
+      showPendingMutation_(); var message = document.getElementById('pendingMutationResult'); if (message) { message.textContent = friendly(result) + ' If retry remains blocked, ask the deployment administrator to review the operation.'; }
+    }
+    return result;
+  });
+}
+function netStart_() {
+  NET_PENDING++;
+  if (NET_HIDE_T) { clearTimeout(NET_HIDE_T); NET_HIDE_T = null; }
+  var el = document.getElementById('netbar');
+  if (!el || el.classList.contains('on') || NET_SHOW_T) { return; }
+  NET_SHOW_T = setTimeout(function () {
+    NET_SHOW_T = null;
+    if (NET_PENDING > 0) { var e = document.getElementById('netbar'); if (e) { e.classList.add('on'); NET_SHOWN_AT = Date.now(); } }
+  }, 140);
+}
+function netEnd_() {
+  NET_PENDING = Math.max(0, NET_PENDING - 1);
+  if (NET_PENDING > 0) { return; }
+  if (NET_SHOW_T) { clearTimeout(NET_SHOW_T); NET_SHOW_T = null; }
+  var el = document.getElementById('netbar');
+  if (!el || !el.classList.contains('on')) { return; }
+  var wait = Math.max(0, 300 - (Date.now() - NET_SHOWN_AT));
+  NET_HIDE_T = setTimeout(function () {
+    NET_HIDE_T = null;
+    if (NET_PENDING === 0) { var e = document.getElementById('netbar'); if (e) { e.classList.remove('on'); } }
+  }, wait);
+}
+// A server that is busy under concurrent load returns a retryable E_BUSY; the
+// operation did not run, so retrying is safe. Back off with jitter so a burst
+// of clients spreads its retries instead of stampeding together. Creates are
+// idempotent by submissionKey, so a retried create can never double-insert.
+function run(action, payload, recovering) {
+  var mutation = RECOVERABLE_ACTIONS.indexOf(action) !== -1;
+  if (mutation && MUTATION_IN_FLIGHT) { return Promise.resolve({ok:false,code:'E_BUSY',error:'E_BUSY: another save is still running.'}); }
+  if (mutation && PENDING_MUTATION && !recovering) { showPendingMutation_(); return Promise.resolve({ok:false,code:'E_RECOVERY',error:'E_RECOVERY: use Retry original change before submitting another save.'}); }
+  if (mutation) { payload = JSON.parse(JSON.stringify(payload || {})); MUTATION_IN_FLIGHT = true; }
+  var maxRetries = 3, attempt = 0;
+  function attemptRun() {
+    return runOnce_(action, payload).then(function (result) {
+      if (result && result.code === 'E_BUSY' && attempt < maxRetries) {
+        attempt++;
+        var delay = Math.round(Math.pow(2, attempt) * 400 + Math.random() * 400);
+        return new Promise(function (r) { setTimeout(r, delay); }).then(attemptRun);
+      }
+      return result;
+    });
+  }
+  netStart_();
+  return attemptRun().then(function (result) {
+    netEnd_();
+    if (mutation) {
+      MUTATION_IN_FLIGHT = false;
+      if (result && result.ok) { PENDING_MUTATION = null; var panel = document.getElementById('pendingMutation'); if (panel) { panel.remove(); } }
+      else if (recovering || !result || ['E_NETWORK','E_INTERNAL','E_RECOVERY'].indexOf(result.code) !== -1) { PENDING_MUTATION = {action:action,payload:payload}; showPendingMutation_(); }
+    }
+    return result;
+  }, function (error) { netEnd_(); if (mutation) { MUTATION_IN_FLIGHT = false; PENDING_MUTATION = {action:action,payload:payload}; showPendingMutation_(); } throw error; });
+}
+function friendly(result) {
+  var msg = result && result.error ? String(result.error) : 'Something went wrong. Try again.';
+  if (msg.indexOf('E_CONFLICT') === 0) { return msg.replace('E_CONFLICT: ', ''); }
+  if (msg.indexOf('E_FORBIDDEN') === 0) { return msg.replace('E_FORBIDDEN: ', ''); }
+  if (msg.indexOf('E_VALIDATION') === 0) { return msg.replace('E_VALIDATION: ', ''); }
+  if (msg.indexOf('E_RECOVERY') === 0) { return msg.replace('E_RECOVERY: ', ''); }
+  if (msg.indexOf('E_RATE_LIMIT') === 0) { return 'Too many actions were sent. Wait 1 minute and try again.'; }
+  if (msg.indexOf('E_BUSY') === 0) { return 'The hub is busy saving other changes. Wait a moment and try again.'; }
+  return msg.indexOf('E_') === 0 ? 'The action could not be completed. Try again.' : msg;
+}
+function deliveryStatusHtml_(counts) {
+  counts = counts || {};
+  var queued = Number(counts.PENDING || 0) + Number(counts.RETRYABLE || 0) + Number(counts.SENDING || 0);
+  var uncertain = Number(counts.UNKNOWN || 0), failed = Number(counts.FAILED || 0);
+  return '<div class="explain" aria-label="Notification delivery status">'
+    + '<div class="row"><span>Queued or being processed</span><span>' + queued + '</span></div>'
+    + '<div class="row"><span>Accepted by Google for sending</span><span>' + Number(counts.SENT || 0) + '</span></div>'
+    + '<div class="row"><span>Delivery unconfirmed</span><span>' + uncertain + '</span></div>'
+    + '<div class="row"><span>Stopped after retries</span><span>' + failed + '</span></div></div>'
+    + (uncertain ? '<p role="status">Some messages may already have been sent. They will not be resent automatically. An administrator must review delivery before sending another message.</p>' : '')
+    + (queued ? '<p class="muted">Queued retries need an installed checking trigger. A queue count does not confirm delivery.</p>' : '');
+}
+/**
+ * Paint a whole screen.
+ *
+ * A new screen starts at its own top. Without this, opening a goal from a
+ * scrolled dashboard drops the reader halfway down it, and on a phone that
+ * hides the guidance panel they opened the goal to read. The app scrolls inside
+ * .main on wide screens and inside the window on narrow ones, so both are reset
+ * and both are wrapped, because the Apps Script sandbox owns the outer frame.
+ */
+function setMain(html) {
+  var main = document.getElementById('main');
+  main.innerHTML = html;
+  main.focus();
+  try { main.scrollTop = 0; } catch (ignoreElement) {}
+  try { window.scrollTo(0, 0); } catch (ignoreWindow) {}
+}
+function loadingHtml(text) { return '<div class="loading"><span class="spin"></span> ' + esc(text || 'Loading...') + '</div>'; }
+function emptyHtml(title, body, action) { return '<div class="empty"><h3>' + esc(title) + '</h3><p>' + esc(body) + '</p>' + (action || '') + '</div>'; }
+function errorHtml(message) { return '<div class="card pad-lg"><h3>We could not load this view</h3><p>' + esc(message) + '</p><button class="btn btn-ghost" type="button" onclick="go(CURRENT)">Try again</button></div>'; }
+function toast(message, bad) { var el = document.getElementById('toast'); document.getElementById('toast-msg').textContent = message; el.classList.toggle('err', !!bad); el.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(function () { el.classList.remove('show'); }, 4000); }
+var DIALOG_SEQ = 0;
+function showDialog(html) {
+  closeDialog(); DIALOG_SEQ++; var wrap = document.createElement('div'); wrap.id = 'dialogWrap'; wrap.className = 'dialog-backdrop'; wrap.dataset.seq = String(DIALOG_SEQ); wrap.dataset.operationKey = makeSubmissionKey_(); wrap.innerHTML = '<section class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialogTitle"><button class="icon-btn dialog-close" type="button" onclick="closeDialog()" aria-label="Close dialog">&#215;</button>' + html + '</section>'; document.body.appendChild(wrap); var first = wrap.querySelector('input,select,textarea,button'); if (first) first.focus(); return DIALOG_SEQ;
+}
+function closeDialog() { var wrap = document.getElementById('dialogWrap'); if (wrap) wrap.remove(); }
+function dialogCommandKey_() { var wrap = document.getElementById('dialogWrap'); return wrap ? wrap.dataset.operationKey : makeSubmissionKey_(); } function dialogSeq_() { var wrap = document.getElementById('dialogWrap'); return wrap ? wrap.dataset.seq : ''; }
+function closeDialogIf(seq) { var wrap = document.getElementById('dialogWrap'); if (wrap && wrap.dataset.seq === String(seq)) { wrap.remove(); return true; } return false; }
+function dialogError(seq, message) {
+  var wrap = document.getElementById('dialogWrap');
+  if (!wrap || wrap.dataset.seq !== String(seq)) { toast(message, true); return; }
+  var box = wrap.querySelector('.form-error');
+  if (!box) { box = document.createElement('div'); box.className = 'form-error'; box.setAttribute('role', 'alert'); var form = wrap.querySelector('form'); if (form) { form.insertBefore(box, form.firstChild); } else { wrap.querySelector('.dialog').appendChild(box); } }
+  box.textContent = message;
+}
+
+function start() {
+  run('bootstrap').then(function (result) {
+    document.getElementById('boot').classList.add('hidden');
+    if (result.code === 'E_NETWORK') { document.getElementById('blocked').classList.remove('hidden'); document.getElementById('blocked-msg').textContent = 'The workspace could not be opened. Ask an administrator to confirm setup and deployment access.'; return; }
+    if (!result.ok || !result.user || !result.user.known) { document.getElementById('blocked').classList.remove('hidden'); return; }
+    BOOT = result; document.documentElement.setAttribute('data-theme', result.theme === 'dark' ? 'dark' : 'light'); renderChrome(); document.getElementById('app').classList.remove('hidden');
+    // Anyone who works the monthly cycle lands on this month. Everyone else
+    // lands on Home, which is still the Intake summary.
+    go(canNav('performance') ? 'performance' : 'home');
+  });
+}
+function renderChrome() {
+  var brand = BOOT.branding || {}, user = BOOT.user;
+  document.documentElement.style.setProperty('--customer-accent', brand.accent || '#19713F');
+  ['customerMark','mobileCustomerMark'].forEach(function (id) { document.getElementById(id).textContent = brand.customerMark || 'PI'; });
+  document.getElementById('customerName').textContent = brand.customerName || 'Your Organization'; document.getElementById('mobileCustomerName').textContent = brand.customerShortName || brand.customerName || 'Your Organization'; document.getElementById('customerDescriptor').textContent = brand.customerDescriptor || 'Multi-site programs';
+  // The product name arrives from the server's single constant. Nothing in the
+  // markup hard-codes it, so renaming the product never touches a template.
+  document.getElementById('productName').textContent = brand.productName || '';
+  document.getElementById('mobileProductName').textContent = brand.productName ? 'on ' + brand.productName : '';
+  if (brand.productName) { document.title = brand.productName; }
+  document.getElementById('userNm').textContent = user.name; document.getElementById('userRl').textContent = user.roleName; document.getElementById('userAv').textContent = (user.name || user.email).split(/\s+/).map(function (p) { return p.charAt(0); }).slice(0, 2).join('').toUpperCase();
+  document.getElementById('scopeRole').textContent = user.roleName; document.getElementById('scopeDescription').textContent = user.primaryScopeName ? user.primaryScopeName + ' (' + user.primaryScopeType + ')' : 'No assigned operational area';
+  renderNav(); renderThemeButton();
+}
+function renderNav() {
+  var currentGroup = null, html = '', missing = (BOOT.performance && BOOT.performance.missingThisPeriod) || 0;
+  (BOOT.nav || []).forEach(function (item) {
+    if (item.group && item.group !== currentGroup) { currentGroup = item.group; html += '<div class="navgroup">' + esc(item.group) + '</div>'; }
+    // The in-app half of the data-due prompt. It rides on the boot call that
+    // already happened, so the count costs no extra round trip.
+    var badge = item.id === 'entry' && missing > 0
+      ? '<span class="nb" title="' + missing + ' still to enter">' + missing + '</span>' : '';
+    html += '<button type="button" data-route="' + esc(item.id) + '" class="navitem ' + (CURRENT === item.id ? 'active' : '') + '" onclick="go(\'' + esc(item.id) + '\')">' + esc(item.label) + badge + '</button>';
+  });
+  document.getElementById('navList').innerHTML = html;
+}
+function canNav(id) { return (BOOT.nav || []).some(function (item) { return item.id === id; }); }
+function go(route) {
+  if (!canNav(route)) { route = 'home'; }
+  CURRENT = route; renderNav(); closeNav();
+  if (route === 'intake') { renderIntake(); }
+  else if (route === 'access') { renderAccess(); }
+  else if (route === 'admin') { renderAdmin(); }
+  else if (route === 'performance') { renderPerformance(); }
+  else if (route === 'entry') { renderEntry(); }
+  else if (route === 'rollup') { renderRollup(); }
+  else if (route === 'goals') { renderGoals(); }
+  else if (route === 'metrics') { renderMetrics(); }
+  else if (route === 'playbook') { renderPlaybook(); }
+  else { renderHome(); }
+}
+function renderHome() {
+  var user = BOOT.user, intro = '<div class="page-head"><div class="crumb">Work</div><h1>Intake that stays accountable</h1><div class="sub">Create requests, assign responsibility, track status, and keep a complete change history in one shared workspace.</div></div>';
+  if (!canNav('intake')) { setMain(intro + '<div class="card pad-lg"><h2>Your account is active</h2><p>Your current role does not include operational Intake records. Review My access for your assigned role and scope.</p><button class="btn btn-primary" type="button" onclick="go(\'access\')">Review my access</button></div>'); return; }
+  setMain(intro + loadingHtml('Loading Intake summary...'));
+  run('intake.list', {}).then(function (result) {
+    if (!result.ok) { setMain(intro + errorHtml(friendly(result))); return; }
+    var items = result.items || [], open = items.filter(function (i) { return i.status !== 'Closed'; }).length, urgent = items.filter(function (i) { return i.priority === 'Urgent' && i.status !== 'Closed'; }).length, waiting = items.filter(function (i) { return i.status === 'Waiting'; }).length;
+    var cards = '<div class="metric-grid"><div class="metric-card"><span>Open requests</span><strong>' + open + '</strong></div><div class="metric-card"><span>Urgent</span><strong>' + urgent + '</strong></div><div class="metric-card"><span>Waiting</span><strong>' + waiting + '</strong></div></div>';
+    var action = '<div class="card pad-lg home-action"><div><h2>Intake workspace</h2><p>Every save is attributed and version checked. If another person changes a request first, the app asks you to reload instead of overwriting their work.</p></div><div class="actions"><button class="btn btn-ghost" type="button" onclick="go(\'intake\')">View Intake</button>' + (BOOT.canCreateIntake ? '<button class="btn btn-primary" type="button" onclick="openIntakeForm()">Create request</button>' : '') + '</div></div>';
+    setMain(intro + cards + action + recentList_(items.slice(0, 5)));
+  });
+}
+function recentList_(items) {
+  if (!items.length) { return emptyHtml('No Intake requests yet', 'Created requests will appear here.', BOOT.canCreateIntake ? '<button class="btn btn-primary" type="button" onclick="openIntakeForm()">Create first request</button>' : ''); }
+  return '<section class="card pad-lg"><div class="toolbar"><h2>Recently updated</h2><button class="btn btn-ghost btn-sm" type="button" onclick="go(\'intake\')">View all</button></div><div class="request-list">' + items.map(requestCard_).join('') + '</div></section>';
+}
+
+function renderIntake() {
+  setMain('<div class="page-head"><div class="crumb">Work</div><h1>Intake</h1><div class="sub">Requests are visible only inside your assigned organization areas.</div></div><div class="toolbar intake-toolbar"><div class="filters"><input id="intakeQuery" class="search" type="search" placeholder="Search requests" aria-label="Search requests"><select id="intakeStatus" aria-label="Filter by status"><option value="">All statuses</option>' + options_(BOOT.intakeStatuses, '') + '</select></div>' + (BOOT.canCreateIntake ? '<button class="btn btn-primary" type="button" onclick="openIntakeForm()">Create request</button>' : '') + '</div><div id="intakeArea">' + loadingHtml('Loading Intake...') + '</div>');
+  document.getElementById('intakeQuery').addEventListener('input', debounce_(loadIntake, 250)); document.getElementById('intakeStatus').addEventListener('change', loadIntake); loadIntake();
+}
+function loadIntake() {
+  var query = document.getElementById('intakeQuery'), status = document.getElementById('intakeStatus'), area = document.getElementById('intakeArea'); if (!area) return;
+  area.innerHTML = loadingHtml('Loading Intake...'); run('intake.list', { query: query ? query.value : '', status: status ? status.value : '' }).then(function (result) { if (!result.ok) { area.innerHTML = errorHtml(friendly(result)); return; } INTAKE = result.items || []; area.innerHTML = INTAKE.length ? '<div class="request-list">' + INTAKE.map(requestCard_).join('') + '</div>' : emptyHtml('No matching requests', 'Change the filters or create a request.', ''); });
+}
+function requestCard_(item) {
+  return '<article class="card request-card"><button class="request-open" type="button" onclick="openIntake(\'' + esc(item.id) + '\')"><div><span class="record-meta">' + esc(item.requestNumber) + ' · ' + esc(item.site) + '</span><h3>' + esc(item.title) + '</h3><p>' + esc(item.description) + '</p></div><div class="request-tags">' + badge_(item.status) + badge_(item.priority) + '</div></button></article>';
+}
+function badge_(value) { var key = String(value || '').toLowerCase().replace(/\s+/g, '-'); return '<span class="badge-pill b-' + esc(key) + '">' + esc(value) + '</span>'; }
+function options_(items, selected) { return (items || []).map(function (item) { return '<option value="' + esc(item) + '" ' + (String(item) === String(selected) ? 'selected' : '') + '>' + esc(item) + '</option>'; }).join(''); }
+function siteOptions_(selected) { return (BOOT.sites || []).map(function (site) { return '<option value="' + esc(site) + '" ' + (String(site) === String(selected) ? 'selected' : '') + '>' + esc(site) + '</option>'; }).join(''); }
+
+function openIntake(id) {
+  setMain(loadingHtml('Opening request...')); run('intake.get', { id: id }).then(function (result) { if (!result.ok) { setMain(errorHtml(friendly(result))); return; } CURRENT_ITEM = result.item; renderIntakeDetail_(result); });
+}
+function renderIntakeDetail_(result) {
+  var item = result.item, history = result.history || [], manage = result.canManage;
+  var actions = '<button class="btn btn-ghost" type="button" onclick="go(\'intake\')">Back to Intake</button>';
+  if (manage || (item.status === 'New' && item.submittedBy === BOOT.user.email)) { actions += '<button class="btn btn-ghost" type="button" onclick="openIntakeForm(CURRENT_ITEM)">Edit request</button>'; }
+  if (manage) { actions += '<button class="btn btn-primary" type="button" onclick="openTransitionForm()">Change status</button>'; }
+  var fields = [['Request type', item.requestType], ['Site', item.site], ['Priority', item.priority], ['Owner', item.owner || 'Not assigned'], ['Next step', item.nextStep || 'Not set'], ['Due date', item.dueDate || 'Not set'], ['Desired outcome', item.desiredOutcome || 'Not provided'], ['Requested support', item.requestedSupport || 'Not provided']];
+  var h = '<div class="page-head"><div class="crumb">' + esc(item.requestNumber) + '</div><h1>' + esc(item.title) + '</h1><div class="sub">Version ' + esc(item.version) + ' · Updated ' + esc(item.updatedAt) + '</div></div><div class="toolbar"><div class="actions">' + actions + '</div><div>' + badge_(item.status) + '</div></div><div class="detail-grid"><section class="card pad-lg"><h2>Request</h2><p class="detail-description">' + esc(item.description) + '</p><dl class="detail-list">' + fields.map(function (field) { return '<div><dt>' + esc(field[0]) + '</dt><dd>' + esc(field[1]) + '</dd></div>'; }).join('') + '</dl></section><section class="card pad-lg"><h2>History</h2>' + (history.length ? '<ol class="history-list">' + history.map(function (entry) { return '<li><strong>' + esc(entry.action) + '</strong><span>' + esc(entry.fromStatus ? entry.fromStatus + ' to ' + entry.toStatus : entry.toStatus) + '</span><small>' + esc(entry.actor) + ' · ' + esc(entry.at) + '</small>' + (entry.note ? '<p>' + esc(entry.note) + '</p>' : '') + '</li>'; }).join('') + '</ol>' : '<p>No history recorded.</p>') + '</section></div>';
+  setMain(h);
+}
+
+function openIntakeForm(item) {
+  item = item || {}; var editing = !!item.id, title = editing ? 'Edit Intake request' : 'Create Intake request';
+  showDialog('<h2 id="dialogTitle">' + title + '</h2><p class="muted">Required fields are marked.</p><form id="intakeForm" onsubmit="saveIntakeForm(event)"><div class="field"><label for="ifTitle">Title (required)</label><input id="ifTitle" maxlength="200" value="' + esc(item.title || '') + '" required></div><div class="grid g-2"><div class="field"><label for="ifType">Request type</label><select id="ifType">' + options_(BOOT.intakeTypes, item.requestType || 'Program support') + '</select></div><div class="field"><label for="ifSite">Site</label><select id="ifSite" required><option value="">Choose a site</option>' + siteOptions_(item.site || '') + '</select></div></div><div class="field"><label for="ifDescription">Description (required)</label><textarea id="ifDescription" rows="5" maxlength="10000" required>' + esc(item.description || '') + '</textarea></div><div class="grid g-2"><div class="field"><label for="ifPriority">Priority</label><select id="ifPriority">' + options_(BOOT.intakePriorities, item.priority || 'Normal') + '</select></div><div class="field"><label for="ifTarget">Target date</label><input id="ifTarget" type="date" value="' + esc(item.targetDate || '') + '"></div></div><div class="field"><label for="ifImpact">Impact</label><textarea id="ifImpact" rows="2">' + esc(item.impact || '') + '</textarea></div><div class="field"><label for="ifOutcome">Desired outcome</label><textarea id="ifOutcome" rows="2">' + esc(item.desiredOutcome || '') + '</textarea></div><div class="field"><label for="ifSupport">Requested support</label><textarea id="ifSupport" rows="2">' + esc(item.requestedSupport || '') + '</textarea></div><div class="grid g-2"><div class="field"><label for="ifContact">Contact name</label><input id="ifContact" value="' + esc(item.contactName || BOOT.user.name) + '"></div><div class="field"><label for="ifEmail">Contact email</label><input id="ifEmail" type="email" value="' + esc(item.contactEmail || BOOT.user.email) + '"></div></div><div class="field"><label for="ifUrl">Supporting link</label><input id="ifUrl" type="url" placeholder="https://" value="' + esc(item.sourceUrl || '') + '"></div><div class="actions"><button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button><button id="saveIntakeButton" class="btn btn-primary" type="submit">' + (editing ? 'Save changes' : 'Create request') + '</button></div></form>');
+  document.getElementById('intakeForm').dataset.id = item.id || ''; document.getElementById('intakeForm').dataset.version = item.version || ''; document.getElementById('intakeForm').dataset.submissionKey = item.submissionKey || makeSubmissionKey_();
+}
+function makeSubmissionKey_() { try { return crypto.randomUUID(); } catch (ignore) { return 'submit-' + Date.now() + '-' + Math.random().toString(36).slice(2); } }
+function saveIntakeForm(event) {
+  event.preventDefault(); var form = event.currentTarget, button = document.getElementById('saveIntakeButton'), seq = dialogSeq_(); button.disabled = true; button.textContent = 'Saving...';
+  var payload = { id: form.dataset.id, version: form.dataset.version, operationKey: dialogCommandKey_(), submissionKey: form.dataset.submissionKey, title: value_('ifTitle'), requestType: value_('ifType'), site: value_('ifSite'), description: value_('ifDescription'), priority: value_('ifPriority'), targetDate: value_('ifTarget'), impact: value_('ifImpact'), desiredOutcome: value_('ifOutcome'), requestedSupport: value_('ifSupport'), contactName: value_('ifContact'), contactEmail: value_('ifEmail'), sourceUrl: value_('ifUrl') };
+  run('intake.save', payload).then(function (result) {
+    if (!result.ok) { var btn = document.getElementById('saveIntakeButton'); if (btn) { btn.disabled = false; btn.textContent = payload.id ? 'Save changes' : 'Create request'; } dialogError(seq, friendly(result)); return; }
+    var mine = closeDialogIf(seq); toast(result.duplicate ? 'This change was already saved. Opening the current request.' : (result.created ? 'Request created.' : 'Changes saved.'));
+    if (mine) { openIntake(result.item.id); } else if (CURRENT === 'intake') { loadIntake(); }
+  });
+}
+function value_(id) { var el = document.getElementById(id); return el ? el.value : ''; }
+function openTransitionForm() {
+  var item = CURRENT_ITEM, allowed = { 'New': ['Triaged','Closed'], 'Triaged': ['Assigned','Waiting','Closed'], 'Assigned': ['In Progress','Waiting','Closed'], 'In Progress': ['Waiting','Resolved','Closed'], 'Waiting': ['Assigned','In Progress','Resolved','Closed'], 'Resolved': ['In Progress','Closed'], 'Closed': ['Triaged'] }[item.status] || [];
+  showDialog('<h2 id="dialogTitle">Change request status</h2><form id="transitionForm" onsubmit="saveTransition(event)"><div class="field"><label for="tfStatus">New status</label><select id="tfStatus">' + options_(allowed, allowed[0] || '') + '</select></div><div class="field"><label for="tfOwner">Owner</label><input id="tfOwner" value="' + esc(item.owner || '') + '"></div><div class="field"><label for="tfNext">Next step</label><textarea id="tfNext" rows="3">' + esc(item.nextStep || '') + '</textarea></div><div class="field"><label for="tfDue">Due date</label><input id="tfDue" type="date" value="' + esc(item.dueDate || '') + '"></div><div class="field"><label for="tfNote">Change note</label><textarea id="tfNote" rows="2"></textarea></div><div class="actions"><button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button><button id="transitionButton" class="btn btn-primary" type="submit">Update status</button></div></form>');
+}
+function saveTransition(event) {
+  event.preventDefault(); var button = document.getElementById('transitionButton'), seq = dialogSeq_(); button.disabled = true; button.textContent = 'Updating...';
+  run('intake.transition', { id: CURRENT_ITEM.id, version: CURRENT_ITEM.version, operationKey: dialogCommandKey_(), status: value_('tfStatus'), owner: value_('tfOwner'), nextStep: value_('tfNext'), dueDate: value_('tfDue'), note: value_('tfNote') }).then(function (result) {
+    if (!result.ok) { var btn = document.getElementById('transitionButton'); if (btn) { btn.disabled = false; btn.textContent = 'Update status'; } dialogError(seq, friendly(result)); return; }
+    var mine = closeDialogIf(seq); toast('Status updated.'); if (mine) { openIntake(result.item.id); }
+  });
+}
+
+function renderAccess() {
+  var user = BOOT.user, scopes = user.scopes || [];
+  setMain('<div class="page-head"><div class="crumb">Account</div><h1>My access</h1><div class="sub">Access is calculated on the server from your Google account, role, and assigned organization areas.</div></div><div class="detail-grid"><section class="card pad-lg"><h2>Role</h2><dl class="detail-list"><div><dt>Name</dt><dd>' + esc(user.name) + '</dd></div><div><dt>Email</dt><dd>' + esc(user.email) + '</dd></div><div><dt>Role</dt><dd>' + esc(user.roleName) + '</dd></div></dl></section><section class="card pad-lg"><h2>Assigned areas</h2>' + (scopes.length ? '<ul class="scope-list">' + scopes.map(function (scope) { return '<li><strong>' + esc(scope.scopeName || scope.scopeId) + '</strong><span>' + esc(scope.scopeType) + (scope.assignmentType ? ' · ' + esc(scope.assignmentType) : '') + '</span></li>'; }).join('') + '</ul>' : '<p>No active operational areas are assigned.</p>') + '</section></div>' + perfCapabilityHtml());
+}
+
+function renderAdmin() {
+  setMain('<div class="page-head"><div class="crumb">System</div><h1>Admin</h1><div class="sub">Manage the small foundation Intake needs: people, access areas, sites, and customer branding.</div></div><div class="grid g-2"><section class="card pad-lg"><div class="toolbar"><h2>People</h2><button class="btn btn-primary btn-sm" type="button" onclick="openPersonForm()">Add person</button></div><div id="peopleArea">' + loadingHtml('Loading people...') + '</div></section><section class="card pad-lg"><div class="toolbar"><h2>Sites</h2><button class="btn btn-primary btn-sm" type="button" onclick="openSiteForm()">Add site</button></div><div id="sitesArea">' + loadingHtml('Loading sites...') + '</div></section></div><section class="card pad-lg"><h2>Customer branding</h2><form onsubmit="saveBranding(event)" class="grid g-2"><div class="field"><label for="brandName">Customer name</label><input id="brandName" value="' + esc(BOOT.branding.customerName) + '"></div><div class="field"><label for="brandShort">Short name</label><input id="brandShort" value="' + esc(BOOT.branding.customerShortName) + '"></div><div class="field"><label for="brandDescriptor">Descriptor</label><input id="brandDescriptor" value="' + esc(BOOT.branding.customerDescriptor) + '"></div><div class="field"><label for="brandMark">Customer mark</label><input id="brandMark" maxlength="3" value="' + esc(BOOT.branding.customerMark) + '"></div><div class="field"><label for="brandAccent">Accent color</label><input id="brandAccent" type="color" value="' + esc(BOOT.branding.accent) + '"></div><div class="actions"><button class="btn btn-primary" type="submit" id="saveBrandingBtn">Save branding</button></div></form></section><section class="card pad-lg perf" id="remindersArea">' + loadingHtml('Loading reminder settings...') + '</section><section class="card pad-lg perf" id="playbookAlertsArea">' + loadingHtml('Loading playbook alert settings...') + '</section>' + perfPermissionMatrixHtml());
+  refreshAdminData_();
+  renderReminderSettings();
+  renderPlaybookAlertSettings();
+}
+var ADMIN_REFRESH = null;
+function refreshAdminData_() {
+  ADMIN_REFRESH = Promise.all([run('access.list', {}), run('site.list', {})]).then(function (results) { if (!results[0].ok || !results[1].ok) { toast('Admin data could not be loaded.', true); return; } ADMIN.people = results[0].items || []; ADMIN.roles = results[0].roles || []; ADMIN.units = results[0].units || []; ADMIN.sites = results[1].items || []; BOOT.sites = ADMIN.sites.filter(function (site) { return truthyClient_(site.active); }).map(function (site) { return site.site; }); if (CURRENT === 'admin') { renderAdminLists_(); } });
+  return ADMIN_REFRESH;
+}
+function renderAdminLists_() {
+  var people = document.getElementById('peopleArea'), sites = document.getElementById('sitesArea'); if (!people || !sites) return;
+  people.innerHTML = ADMIN.people.length ? '<table><thead><tr><th>Person</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>' + ADMIN.people.map(function (item, i) { return '<tr><td><strong>' + esc(item.name) + '</strong><small>' + esc(item.email) + '</small></td><td>' + esc(item.roleName) + '</td><td>' + (item.pending ? 'Recovery required' : truthyClient_(item.active) ? 'Active' : 'Inactive') + '</td><td><button class="btn btn-ghost btn-sm" type="button" ' + (item.pending ? 'disabled ' : '') + 'onclick="openPersonForm(' + i + ')">Edit</button></td></tr>'; }).join('') + '</tbody></table>' : '<p>No people configured.</p>';
+  sites.innerHTML = ADMIN.sites.length ? '<table><thead><tr><th>Site</th><th>Region</th><th>Status</th><th></th></tr></thead><tbody>' + ADMIN.sites.map(function (item, i) { return '<tr><td>' + esc(item.site) + '</td><td>' + esc(item.region || '') + '</td><td>' + (item.pending ? 'Recovery required' : truthyClient_(item.active) ? 'Active' : 'Inactive') + '</td><td><button class="btn btn-ghost btn-sm" type="button" onclick="openSiteForm(' + i + ')">Edit</button></td></tr>'; }).join('') + '</tbody></table>' : '<p>No sites configured.</p>';
+}
+function openSiteForm(index) { Promise.resolve(ADMIN_REFRESH).then(function () { openSiteFormNow_(index); }); }
+function openSiteFormNow_(index) {
+  var item = index == null ? { active: true } : ADMIN.sites[index]; showDialog('<h2 id="dialogTitle">' + (item.site ? 'Edit site' : 'Add site') + '</h2><form onsubmit="saveSite(event,' + (index == null ? 'null' : index) + ')"><div class="field"><label for="siteName">Site name (required)</label><input id="siteName" value="' + esc(item.site || '') + '" ' + (item.site ? 'readonly' : '') + ' required></div><div class="field"><label for="siteRegion">Region (optional)</label><input id="siteRegion" value="' + esc(item.region || '') + '"></div><label><input id="siteActive" type="checkbox" ' + (truthyClient_(item.active) ? 'checked' : '') + '> Active</label><div class="actions"><button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button><button id="saveSiteButton" class="btn btn-primary" type="submit">Save site</button></div></form>');
+}
+function saveSite(event, index) {
+  event.preventDefault(); var old = index == null ? {} : ADMIN.sites[index], button = document.getElementById('saveSiteButton'), seq = dialogSeq_(); if (button) { button.disabled = true; button.textContent = 'Saving...'; }
+  run('site.save', { item: { submissionKey: dialogCommandKey_(), originalSite: old.site || '', site: value_('siteName'), region: value_('siteRegion'), active: document.getElementById('siteActive') ? document.getElementById('siteActive').checked : true } }).then(function (result) {
+    if (!result.ok) { var btn = document.getElementById('saveSiteButton'); if (btn) { btn.disabled = false; btn.textContent = 'Save site'; } dialogError(seq, friendly(result)); return; }
+    closeDialogIf(seq); toast('Site saved.'); refreshAdminData_();
+  });
+}
+function openPersonForm(index) { Promise.resolve(ADMIN_REFRESH).then(function () { openPersonFormNow_(index); }); }
+function openPersonFormNow_(index) {
+  var item = index == null ? { active: true, roleKey: 'site', scopes: [] } : ADMIN.people[index], primary = (item.scopes || []).filter(function (scope) { return truthyClient_(scope.primary); })[0] || item.scopes[0] || {};
+  var roles = ADMIN.roles.map(function (role) { return '<option value="' + esc(role.roleKey) + '" ' + (role.roleKey === (item.roleKey || item.role) ? 'selected' : '') + '>' + esc(role.displayName) + '</option>'; }).join('');
+  var units = ADMIN.units.filter(function (unit) { return truthyClient_(unit.active); }).sort(function (a, b) { return String(a.name).localeCompare(String(b.name)); }).map(function (unit) { return '<option value="' + esc(unit.unitId) + '" ' + (unit.unitId === primary.scopeId ? 'selected' : '') + '>' + esc(unit.name + ' (' + unit.unitType + ')') + '</option>'; }).join('');
+  showDialog('<h2 id="dialogTitle">' + (item.email ? 'Edit person' : 'Add person') + '</h2><form onsubmit="savePerson(event)"><div class="field"><label for="personName">Name (required)</label><input id="personName" value="' + esc(item.name || '') + '" required></div><div class="field"><label for="personEmail">Email (required)</label><input id="personEmail" type="email" value="' + esc(item.email || '') + '" ' + (item.email ? 'readonly' : '') + ' required></div><div class="field"><label for="personRole">Role</label><select id="personRole">' + roles + '</select></div><div class="field"><label for="personScope">Primary access area</label><select id="personScope">' + units + '</select></div><label><input id="personActive" type="checkbox" ' + (truthyClient_(item.active) ? 'checked' : '') + '> Active</label><div class="actions"><button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button><button id="savePersonButton" class="btn btn-primary" type="submit">Save person</button></div></form>');
+}
+function savePerson(event) {
+  event.preventDefault(); var unitId = value_('personScope'), unit = ADMIN.units.filter(function (item) { return item.unitId === unitId; })[0] || {}, button = document.getElementById('savePersonButton'), seq = dialogSeq_(); if (button) { button.disabled = true; button.textContent = 'Saving...'; }
+  run('access.save', { email: value_('personEmail'), name: value_('personName'), roleKey: value_('personRole'), active: document.getElementById('personActive') ? document.getElementById('personActive').checked : true, scopes: [{ scopeId: unitId, scopeType: unit.unitType, primary: true, assignmentType: 'Primary', status: 'active' }] }).then(function (result) {
+    if (!result.ok) { var btn = document.getElementById('savePersonButton'); if (btn) { btn.disabled = false; btn.textContent = 'Save person'; } dialogError(seq, friendly(result)); return; }
+    closeDialogIf(seq); toast('Person saved.'); refreshAdminData_();
+  });
+}
+function saveBranding(event) { event.preventDefault(); var button = document.getElementById('saveBrandingBtn'); if (button) { button.disabled = true; button.textContent = 'Saving...'; } run('branding.save', { customerName: value_('brandName'), customerShortName: value_('brandShort'), customerDescriptor: value_('brandDescriptor'), customerMark: value_('brandMark'), accent: value_('brandAccent') }).then(function (result) { var btn = document.getElementById('saveBrandingBtn'); if (btn) { btn.disabled = false; btn.textContent = 'Save branding'; } if (!result.ok) { toast(friendly(result), true); return; } BOOT.branding = result.branding; renderChrome(); toast('Branding saved.'); }); }
+
+function toggleTheme() { var theme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', theme); try { localStorage.setItem('pi-hub-theme', theme); } catch (ignore) {} renderThemeButton(); run('theme.save', { theme: theme }); }
+// Drawn as an icon rather than a text glyph. The moon and sun characters render
+// at whatever weight the font happens to have and looked like a stray letter.
+function renderThemeButton() {
+  var button = document.getElementById('themeBtn');
+  if (!button) { return; }
+  var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  button.setAttribute('aria-label', dark ? 'Switch to the light theme' : 'Switch to the dark theme');
+  button.innerHTML = dark
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M4.4 4.4l1.6 1.6M18 18l1.6 1.6M2.6 12h2.2M19.2 12h2.2M4.4 19.6 6 18M18 6l1.6-1.6"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.8 13.4A8.6 8.6 0 1 1 10.6 3.2a6.7 6.7 0 0 0 10.2 10.2Z"/></svg>';
+}
+function toggleNav() { var side = document.getElementById('sidebar'), open = side.classList.toggle('open'); document.getElementById('navBackdrop').hidden = !open; document.getElementById('menuBtn').setAttribute('aria-expanded', String(open)); }
+function closeNav() { document.getElementById('sidebar').classList.remove('open'); document.getElementById('navBackdrop').hidden = true; document.getElementById('menuBtn').setAttribute('aria-expanded', 'false'); }
+function toggleMobileSearch_() { var panel = document.getElementById('mobileSearchPanel'), hidden = !panel.hidden; panel.hidden = hidden; if (!hidden) document.getElementById('mobileGlobalSearch').focus(); }
+function globalSearchKey_(event) { if (event.key !== 'Enter') return; var value = event.currentTarget.value; if (!canNav('intake')) { toast('Your role does not include Intake records.', true); return; } go('intake'); setTimeout(function () { var query = document.getElementById('intakeQuery'); if (query) { query.value = value; loadIntake(); } }, 0); }
+function debounce_(fn, delay) { var timer; return function () { clearTimeout(timer); timer = setTimeout(fn, delay); }; }
+document.addEventListener('keydown', function (event) { if (event.key === 'Escape') { closeDialog(); closeNav(); } });
+start();
+</script>

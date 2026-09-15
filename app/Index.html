@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- The real title is set server side from the one product-name constant. This
+     placeholder is what shows for the moment before the app boots. -->
+<title>Operating hub</title>
+<script>
+(function () {
+  var saved = 'light';
+  try { saved = localStorage.getItem('pi-hub-theme') || 'light'; } catch (ignore) {}
+  document.documentElement.setAttribute('data-theme', saved === 'dark' ? 'dark' : 'light');
+})();
+</script>
+<?!= include_('Styles'); ?>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+<div id="netbar" aria-hidden="true"></div>
+
+<div id="boot" class="loading boot-state"><span class="spin"></span> Loading your hub...</div>
+
+<div id="blocked" class="hidden">
+  <div class="blocker">
+    <div class="blocked-mark" aria-hidden="true">PI</div>
+    <h1>You are signed in, but not set up yet</h1>
+    <p class="muted" id="blocked-msg">Ask a PI team admin to activate your user record and assign at least one access area. Once they do, refresh this page.</p>
+  </div>
+</div>
+
+<div id="app" class="hidden app-shell">
+  <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
+    <div class="customer-lockup">
+      <div class="customer-mark" id="customerMark" aria-hidden="true">PO</div>
+      <div class="customer-copy">
+        <strong id="customerName">Your organization</strong>
+        <span id="customerDescriptor">Multi-site programs</span>
+        <small>on <b id="productName"></b></small>
+      </div>
+      <button class="icon-btn mobile-nav-close" type="button" onclick="closeNav()" aria-label="Close menu">&#215;</button>
+    </div>
+    <nav class="nav-list" id="navList"></nav>
+    <section class="scope-card" aria-label="Current access">
+      <span>Current access</span>
+      <strong id="scopeRole"></strong>
+      <p id="scopeDescription"></p>
+    </section>
+  </aside>
+
+  <button class="nav-backdrop" id="navBackdrop" type="button" onclick="closeNav()" aria-label="Close menu" hidden></button>
+
+  <div class="app-column">
+    <header class="commandbar">
+      <button class="icon-btn menu-btn" id="menuBtn" type="button" onclick="toggleNav()" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <div class="mobile-brand" aria-label="Your organization and product">
+        <span id="mobileCustomerMark">PO</span>
+        <div><strong id="mobileCustomerName">Your organization</strong><small id="mobileProductName"></small></div>
+      </div>
+      <label class="command-search" for="globalSearch">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+        <span class="sr-only">Search goals, metrics and requests</span>
+        <input id="globalSearch" type="search" placeholder="Search goals, metrics and requests" onkeydown="globalSearchKey_(event)">
+      </label>
+      <div class="command-spacer"></div>
+      <button class="icon-btn mobile-search-btn" type="button" onclick="toggleMobileSearch_()" aria-label="Search requests" aria-expanded="false" aria-controls="mobileSearchPanel">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+      </button>
+      <button class="icon-btn" onclick="toggleTheme()" aria-label="Toggle theme" id="themeBtn"></button>
+      <div class="userchip">
+        <div class="av" id="userAv" aria-hidden="true"></div>
+        <div class="meta-txt"><div class="nm" id="userNm"></div><div class="rl" id="userRl"></div></div>
+      </div>
+    </header>
+    <div class="mobile-search-panel" id="mobileSearchPanel" hidden>
+      <label class="sr-only" for="mobileGlobalSearch">Search requests</label>
+      <input id="mobileGlobalSearch" type="search" placeholder="Search requests" onkeydown="globalSearchKey_(event)">
+    </div>
+    <main class="main" id="main" tabindex="-1"></main>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"><span class="ck" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 6"/></svg></span><span id="toast-msg"></span></div>
+
+<?!= include_('PerformanceUi'); ?>
+<?!= include_('ImproveUi'); ?>
+<?!= include_('ClientJs'); ?>
+</body>
+</html>

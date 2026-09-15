@@ -1,0 +1,12 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
+const candidate=process.argv[2];if(!candidate)throw Error('Pass the generated candidate directory.');
+const folder=path.resolve(candidate),manifest=JSON.parse(fs.readFileSync(path.join(folder,'PACKAGE.json'),'utf8'));
+const source=fs.readFileSync(path.join(folder,'editor-install/Server.gs'),'utf8');
+const hash=require('node:crypto').createHash('sha256').update(source).digest('hex');assert.equal(hash,manifest.editorBundle.sha256);
+const h=require('./security-harness')();vm.runInContext(source,h.sandbox,{filename:'Server.gs'});h.setup();
+assert.equal(h.call('bootstrap').user.known,true);
+const created=h.call('intake.save',{submissionKey:'bundle-create',title:'Bundle request',site:'Harbor North',description:'Synthetic consolidated installation check.'});assert.equal(created.ok,true,JSON.stringify(created));
+h.switchUser('unknown@example.org');assert.equal(h.call('intake.get',{id:created.item.id}).code,'E_FORBIDDEN');
+const publicNames=Array.from(source.matchAll(/^function\s+([A-Za-z0-9_]+)\s*\(/gm),m=>m[1]).filter(name=>!name.endsWith('_')).sort();assert.deepEqual(publicNames,['api','doGet','onOpen']);
+console.log('Editor bundle: hash, provisioning, authorized intake, unknown-user denial, and public entry points passed');

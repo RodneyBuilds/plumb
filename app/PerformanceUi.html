@@ -1,0 +1,1472 @@
+<!-- voice-lint: off (contains CSS and JS: "transform" is a CSS property, not prose) -->
+<script>
+'use strict';
+/**
+ * PerformanceUi.html - the Performance screens.
+ *
+ * Loaded before ClientJs so its route handlers exist by the time the app boots.
+ * It borrows esc, run, friendly, toast and the dialog helpers from ClientJs
+ * rather than restating them.
+ *
+ * The status rules live on the server. The only arithmetic repeated here is the
+ * final comparison used for the live reading while somebody types, marked below
+ * and pinned by a parity test against the real engine.
+ */
+
+var PERF = { board: null, entry: null, drafts: {}, goal: null, metrics: null, rollup: null, wizard: null, saving: false };
+
+/**
+ * Three progressive enhancements. Each is detected, never assumed, because the
+ * Apps Script sandbox is a cross-origin IFRAME and answers these differently
+ * from a normal tab. Every one of them degrades to a plain, complete screen.
+ */
+var PERF_ENHANCE = {
+  viewTransitions: typeof document.startViewTransition === 'function',
+  containerQueries: !!(window.CSS && CSS.supports && CSS.supports('container-type', 'inline-size')),
+  variableFonts: !!(window.CSS && CSS.supports && CSS.supports('font-variation-settings', '"wght" 550'))
+};
+
+function perfReducedMotion() {
+  try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (ignore) { return false; }
+}
+
+/**
+ * On view transitions, and why this app detects them and does not use them.
+ *
+ * They were tried in all 3 places they could go, and each was worse than not
+ * having them:
+ *
+ * 1. Leaving a screen for the loading state. The outgoing snapshot outlives the
+ *    skeleton whenever the server replies quickly, so the old screen ghosts
+ *    over the new one for a quarter of a second.
+ * 2. Arriving at real content. The same problem the other way round, and it
+ *    also cross-fades the skeleton's text over the real heading, which renders
+ *    a briefly garbled word.
+ * 3. An in-place change such as a wizard step. The callback runs a frame later,
+ *    so for that frame the old fields are still on screen and still accept
+ *    typing that is about to be thrown away.
+ *
+ * The reason underneath all 3 is that this platform already has a designed
+ * wait. Every route change is a 400 to 1500ms round trip covered by a skeleton,
+ * and arriving plays the entrance choreography. The skeleton is the transition.
+ * A cross-fade on top of it is a second transition competing with the first.
+ *
+ * The capability is still detected, because being able to read what this
+ * sandbox actually supports from a live deployment is worth having, and because
+ * the answer belongs in the platform recipe. It is simply not used.
+ */
+function perfPaint(html, mode) {
+  var animate = mode === 'content' && !perfReducedMotion();
+  setMain('<div class="perf' + (animate ? ' anim' : '') + '">' + html + '</div>');
+  perfAfterRender();
+}
+/** Arriving at real content. */
+function perfSetMain(html) { perfPaint(html, 'content'); }
+/** Changing something in place, such as a wizard step. */
+function perfSetPlain(html) { perfPaint(html, 'plain'); }
+
+/**
+ * Every screen is stamped when it starts loading, and a reply that belongs to
+ * an abandoned screen is dropped rather than painted.
+ *
+ * Without this, clicking one route and then another leaves whichever server
+ * reply happens to arrive last on screen, which is not necessarily the one the
+ * user asked for second. Every route change here is a 400 to 1500ms round trip,
+ * so there is plenty of room for 2 to be in flight at once.
+ */
+var PERF_ROUTE_SEQ = 0;
+function perfShowSkeleton() {
+  perfPaint(perfSkeleton(), 'route');
+  return ++PERF_ROUTE_SEQ;
+}
+function perfIsCurrent(token) { return token === PERF_ROUTE_SEQ; }
+
+/** Count-ups run once, after paint, and only where motion is welcome. */
+function perfAfterRender() {
+  var targets = document.querySelectorAll('[data-count]');
+  for (var i = 0; i < targets.length; i++) { perfCountUp(targets[i]); }
+  /* The worksheet's progress bar and its "still empty" line are derived from
+     the drafts, so they have to be filled on first paint as well as on every
+     keystroke. Without this they render blank until somebody types. */
+  if (document.getElementById('entryBands')) { perfRefreshProgress(); }
+}
+function perfCountUp(el) {
+  var to = Number(el.getAttribute('data-count'));
+  if (!isFinite(to)) { return; }
+  /* Show the final number immediately and preserve its unit and precision. */
+  el.textContent = perfFmt(el.getAttribute('data-count-format') || 'count', to);
+}
+
+/* ============================ formatting ============================ */
+
+function perfFmt(metricType, value) {
+  if (value === null || value === undefined || value === '') { return ''; }
+  var n = Number(value);
+  if (!isFinite(n)) { return ''; }
+  if (metricType === 'percentage') { return (Math.round(n * 10) / 10).toFixed(1) + '%'; }
+  if (metricType === 'average') { return (Math.round(n * 10) / 10).toFixed(1); }
+  return String(Math.round(n));
+}
+function perfPlural(count, one, many) { return count + ' ' + (count === 1 ? one : many); }
+/* Only a percentage carries a numerator and denominator. Counts, journeys and
+   averages are a single value, so a "(x of y)" suffix is meaningless for them
+   and, when the parts read back as undefined, prints "(undefined of undefined)". */
+function perfHasParts_(item, entry) {
+  return item.metricType === 'percentage' && entry.numerator != null && entry.numerator !== '' && entry.denominator != null && entry.denominator !== '';
+}
+
+/** Every status carries a glyph as well as a colour. */
+function perfStatusPill(result) {
+  var status = result && result.status;
+  if (status === 'On track') { return '<span class="pill p-ok"><b class="gl">&check;</b> On track</span>'; }
+  if (status === 'At risk') { return '<span class="pill p-warn"><b class="gl">!</b> At risk</span>'; }
+  if (status === 'Off track') { return '<span class="pill p-err"><b class="gl">&times;</b> Off track</span>'; }
+  if (status === 'Insufficient data') { return '<span class="pill p-warn"><b class="gl">~</b> Out of date</span>'; }
+  if (status === 'Not reported') { return '<span class="pill p-none"><b class="gl">?</b> Not reported</span>'; }
+  if (result && result.noData) { return '<span class="pill p-none"><b class="gl">&ndash;</b> No data</span>'; }
+  return '<span class="pill p-none"><b class="gl">?</b> Not entered</span>';
+}
+
+function perfTrendText(result, metricType) {
+  if (!result || result.trend === 'Unknown') { return 'Not enough history for a trend'; }
+  var moved = result.trendChange ? ', moved ' + (result.trendChange > 0 ? '+' : '') + perfFmt(metricType, result.trendChange) : '';
+  if (result.trend === 'Improving') { return '&uarr; Improving, ' + perfPlural(result.trendMonths, 'month', 'months') + moved; }
+  if (result.trend === 'Declining') { return '&darr; Declining, ' + perfPlural(result.trendMonths, 'month', 'months') + moved; }
+  return '&rarr; Holding steady';
+}
+
+/* ---8<--- PREVIEW-PARITY-START ---8<---
+   The only status arithmetic in the browser. It is the last step of the server
+   engine and nothing else: no staleness, no trend, no missing-month rules. A
+   test extracts this exact function and asserts it agrees with the real engine
+   across every goal kind and both metric directions. */
+function perfPreviewStatus(preview, value) {
+  var ratio;
+  if (preview.goalKind === 'journey') {
+    var span = Number(preview.target) - Number(preview.baseline);
+    var progress = span === 0 ? 1 : (Number(value) - Number(preview.baseline)) / span;
+    var elapsed = Number(preview.elapsed);
+    ratio = elapsed === 0 ? (progress > 0 ? 1 : 0) : progress / elapsed;
+    if (progress >= 1) { ratio = Math.max(ratio, 1); }
+  } else if (preview.direction === 'lower') {
+    ratio = Number(value) === 0 ? (Number(preview.target) === 0 ? 1 : 9.99) : Number(preview.target) / Number(value);
+  } else {
+    ratio = Number(preview.target) === 0 ? 1 : Number(value) / Number(preview.target);
+  }
+  if (!isFinite(ratio)) { ratio = 9.99; }
+  ratio = Math.max(-9.99, Math.min(9.99, Math.round(ratio * 1000) / 1000));
+  return ratio >= Number(preview.onTrackPace) ? 'On track' : (ratio >= Number(preview.atRiskPace) ? 'At risk' : 'Off track');
+}
+/* ---8<--- PREVIEW-PARITY-END ---8<--- */
+
+/* ============================ the trajectory ============================ */
+
+/**
+ * The signature element. The last 6 periods drawn as a line with dots against a
+ * dashed target line, with the newest dot enlarged.
+ *
+ * A line and not bars, on purpose. Bars are only honest from a zero baseline,
+ * and a zero baseline flattens tightly clustered data such as 96, 96, 96, 92,
+ * 92, 92 into 6 near-identical blocks, which defeats the whole point. A line
+ * carries shape at any scale, so the axis can sit close to the data.
+ *
+ * A period nobody reported breaks the line and shows a hatched gap. It is never
+ * bridged, because a straight line through a month that never happened is a
+ * drawing of data that does not exist.
+ */
+function perfTrajectory(item, options) {
+  options = options || {};
+  var series = item.trajectory || [];
+  if (!series.length) { return ''; }
+  var metricType = item.metricType;
+  var values = series.filter(function (point) { return point.value !== null; }).map(function (point) { return Number(point.value); });
+  var pool = values.slice();
+  if (item.target !== null && item.target !== undefined && item.target !== '') { pool.push(Number(item.target)); }
+  if (item.goalKind === 'journey' && item.baseline !== null && item.baseline !== '') { pool.push(Number(item.baseline)); }
+  if (!pool.length) { pool = [0, 1]; }
+
+  var lo = Math.min.apply(null, pool), hi = Math.max.apply(null, pool);
+  var range = hi - lo;
+  if (range === 0) { range = Math.abs(hi) * 0.1 || 1; }
+  var pad = range * 0.35, min = lo - pad, max = hi + pad;
+  var count = series.length;
+  var y = function (value) { return Math.max(2, Math.min(98, ((Number(value) - min) / (max - min)) * 100)); };
+  var x = function (index) { return count <= 1 ? 50 : (index / (count - 1)) * 100; };
+
+  var segments = [], current = [];
+  series.forEach(function (point, index) {
+    if (point.value === null) { if (current.length) { segments.push(current); } current = []; return; }
+    current.push([x(index), 100 - y(point.value)]);
+  });
+  if (current.length) { segments.push(current); }
+
+  var paths = segments.filter(function (segment) { return segment.length > 1; }).map(function (segment) {
+    return '<polyline points="' + segment.map(function (point) { return point[0].toFixed(2) + ',' + point[1].toFixed(2); }).join(' ')
+      + '" fill="none" stroke="var(--primary)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"'
+      + ' vector-effect="non-scaling-stroke" opacity=".55"/>';
+  }).join('');
+
+  var lastIndex = -1;
+  series.forEach(function (point, index) { if (point.value !== null) { lastIndex = index; } });
+
+  var dotOrder = 0;
+  var dots = series.map(function (point, index) {
+    if (point.value === null) {
+      if (!point.noData) { return ''; }
+      /* A month somebody declared as having genuinely no data is marked with a
+         flat dash, so it reads differently from a month nobody answered. */
+      return '<span class="nodata-mark" style="left:' + x(index).toFixed(2) + '%" title="' + esc(point.label) + ': reported as genuinely no data"></span>';
+    }
+    dotOrder++;
+    return '<span class="pt' + (index === lastIndex ? ' last' : '') + '" style="left:' + x(index).toFixed(2)
+      + '%;bottom:' + y(point.value).toFixed(2) + '%;--d:' + dotOrder + '" title="' + esc(point.label) + ': ' + esc(perfFmt(metricType, point.value)) + '"></span>';
+  }).join('');
+
+  var gaps = series.map(function (point, index) {
+    if (point.reported) { return ''; }
+    var half = count <= 1 ? 50 : 100 / (count - 1) / 2;
+    var left = Math.max(0, x(index) - half), right = Math.min(100, x(index) + half);
+    return '<span class="gap" style="left:' + left.toFixed(2) + '%;width:' + (right - left).toFixed(2)
+      + '%" title="' + esc(point.label) + ': nobody entered a number"></span>';
+  }).join('');
+
+  var targetPos = y(item.target);
+  var axis = options.axis
+    ? '<div class="axis">' + series.map(function (point) { return '<span>' + esc(point.short) + '</span>'; }).join('') + '</div>'
+    : '';
+
+  return '<div class="chart' + (options.axis ? ' with-axis' : '') + '" role="img" aria-label="' + esc(perfTrajectoryLabel(item, series)) + '">'
+    + gaps
+    + '<div class="chart-ink"><svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">' + paths + '</svg></div>'
+    + dots
+    + '<span class="tline" style="bottom:' + targetPos.toFixed(2) + '%"></span>'
+    + '<span class="tlab" style="bottom:' + targetPos.toFixed(2) + '%">' + esc(perfFmt(metricType, item.target)) + '</span>'
+    + axis
+    + '</div>';
+}
+
+/** The chart said out loud, for anyone not reading it with their eyes. */
+function perfTrajectoryLabel(item, series) {
+  var parts = series.map(function (point) {
+    if (point.noData) { return point.short + ' no data'; }
+    if (point.value === null) { return point.short + ' not reported'; }
+    return point.short + ' ' + perfFmt(item.metricType, point.value);
+  });
+  return item.metricName + ', last ' + series.length + ' months against a target of '
+    + perfFmt(item.metricType, item.target) + '. ' + parts.join(', ') + '.';
+}
+
+/* ============================ dashboard ============================ */
+
+function renderPerformance() {
+  var token = perfShowSkeleton();
+  run('performance.board', {}).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    PERF.board = result;
+    perfSetMain(perfBoardHtml(result));
+  });
+}
+
+function perfSkeleton() {
+  /* Grey shapes only. A skeleton that spells out a word cross-fades that word
+     over the real heading, and the announcement belongs to screen readers
+     anyway, which is what aria-busy and the hidden label are for. */
+  return '<div aria-busy="true"><span class="sr-only">Loading</span>'
+    + '<div class="skel" style="height:12px;width:96px;margin-bottom:14px"></div>'
+    + '<div class="skel" style="height:44px;width:300px;margin-bottom:22px"></div>'
+    + '<div class="skel" style="height:108px;border-radius:20px;margin-bottom:18px"></div>'
+    + '<div class="gridcards">'
+    + '<div class="skel" style="height:214px;border-radius:18px"></div>'
+    + '<div class="skel" style="height:214px;border-radius:18px"></div>'
+    + '<div class="skel" style="height:214px;border-radius:18px"></div>'
+    + '</div></div>';
+}
+
+function perfBoardHtml(board) {
+  var counts = board.counts;
+  var scope = BOOT.user.primaryScopeName || 'Your access area';
+  var lead, sub;
+  if (!counts.total) {
+    lead = 'No goals are set for your access area yet.';
+    sub = 'Once a goal is set it appears here with its trajectory.';
+  } else if (counts.attention === 0 && counts.unreported === 0) {
+    lead = 'Every goal in scope is on track and this month is fully reported.';
+    sub = perfEntryWindowLine(board);
+  } else if (counts.unreported > 0 && counts.attention > 0) {
+    lead = perfPlural(counts.attention, 'goal needs', 'goals need') + ' attention and '
+      + perfPlural(counts.unreported, 'metric has', 'metrics have') + ' no number for ' + esc(board.periodMonth) + '.';
+    sub = perfWorstLine(board);
+  } else if (counts.unreported > 0) {
+    lead = perfPlural(counts.unreported, 'metric has', 'metrics have') + ' no number for ' + esc(board.periodMonth)
+      + '. Nothing here should be read as fine until they are in.';
+    sub = perfEntryWindowLine(board);
+  } else {
+    lead = perfPlural(counts.attention, 'goal needs', 'goals need') + ' attention this month.';
+    sub = perfWorstLine(board);
+  }
+
+  var cards = board.items.map(function (item, index) { return perfGoalCard(item, index, board); }).join('');
+
+  return '<div class="page-head"><div class="page-head-copy">'
+    + '<div class="crumb">' + esc(scope) + '</div>'
+    + '<h1>' + esc(board.periodLabel) + '</h1>'
+    + '<p class="sub">' + (board.late
+      ? 'Entry for ' + esc(board.periodMonth) + ' closed on ' + esc(board.entryClosesOnLabel) + '. Late numbers are still accepted and are marked as late.'
+      : 'Entry for ' + esc(board.periodMonth) + ' closes on ' + esc(board.entryClosesOnLabel) + '.') + '</p>'
+    + '</div><div class="head-actions">'
+    + (board.canEnter ? '<button class="btn btn-primary" type="button" onclick="go(\'entry\')">Enter ' + esc(board.periodMonth) + ' numbers</button>' : '')
+    + '</div></div>'
+    + '<div class="brief">'
+    + '<div class="lead"><span class="bl">Needs your attention</span><strong>' + lead + '</strong><span class="sm">' + sub + '</span></div>'
+    + '<div class="bm"><span class="bl">On track</span><strong class="tnum" data-count="' + counts.onTrack + '">0</strong><span>of ' + perfPlural(counts.total, 'goal', 'goals') + '</span></div>'
+    + '<div class="bm"><span class="bl">Need attention</span><strong class="tnum" data-count="' + counts.attention + '">0</strong><span>at risk or off track</span></div>'
+    + '<div class="bm"><span class="bl">Not reported</span><strong class="tnum" data-count="' + counts.unreported + '">0</strong><span>no ' + esc(board.periodMonth) + ' number</span></div>'
+    + '</div>'
+    + (counts.total
+      ? '<div class="gridcards">' + cards + '</div>'
+      : '<div class="card empty"><h3>No goals in your access area yet</h3><p style="margin-top:8px">Once a goal is set for your site it appears here with its trajectory.</p></div>');
+}
+
+/** Said the same way everywhere: a window that has already shut does not close. */
+function perfEntryWindowLine(board) {
+  return board.late
+    ? 'Entry closed on ' + esc(board.entryClosesOnLabel) + '. Late numbers still count.'
+    : 'Entry closes on ' + esc(board.entryClosesOnLabel) + '.';
+}
+
+function perfWorstLine(board) {
+  var worst = board.items.filter(function (item) { return item.result.status === 'Off track'; })[0];
+  if (!worst) { return perfEntryWindowLine(board); }
+  return esc(worst.metricName.toLowerCase()) + ' at ' + esc(worst.site) + ' is the furthest behind.';
+}
+
+function perfGoalCard(item, index, board) {
+  var result = item.result;
+  var unreported = result.status === 'Not yet measured' || result.status === 'Not reported';
+  var cls = unreported ? ' waiting' : (result.status === 'Insufficient data' ? ' stale' : '');
+
+  var big;
+  if (unreported || result.status === 'Insufficient data') {
+    var seen = result.latestPeriod
+      ? esc(perfMonthOf(result.latestPeriod)) + ' was ' + esc(perfFmt(item.metricType, result.latestValue))
+      : 'Nothing reported yet';
+    big = '<div class="now quiet">' + (result.noData ? 'No data for ' + esc(board.periodMonth) : 'No ' + esc(board.periodMonth) + ' number')
+      + '<small>' + seen + '</small></div>';
+  } else {
+    var small;
+    if (item.metricType === 'percentage' && result.latestNumerator !== null) {
+      small = result.latestNumerator + ' of ' + result.latestDenominator;
+    } else if (item.goalKind === 'journey') {
+      small = 'from ' + esc(perfFmt(item.metricType, item.baseline)) + ' at the start';
+    } else {
+      var gap = item.direction === 'lower' ? result.latestValue - item.target : item.target - result.latestValue;
+      small = gap > 0
+        ? esc(perfFmt(item.metricType, Math.abs(gap))) + ' short of ' + esc(perfFmt(item.metricType, item.target))
+        : 'ahead of ' + esc(perfFmt(item.metricType, item.target));
+    }
+    big = '<div class="now tnum">' + esc(perfFmt(item.metricType, result.latestValue)) + '<small>' + small + '</small></div>';
+  }
+
+  var siteLine = board.sites.length > 1 ? '<div class="gsite">' + esc(item.site) + '</div>' : '';
+  var staleNote = (result.status === 'Insufficient data' || result.status === 'Not reported') && result.latestPeriod
+    ? '<div class="trend warn">Last reported ' + esc(perfMonthOf(result.latestPeriod)) + ', ' + perfPlural(result.stale, 'month', 'months') + ' ago</div>'
+    : '';
+  var footAction = unreported && board.canEnter && !result.noData
+    ? '<button class="enterbtn" type="button" onclick="go(\'entry\')">Enter ' + esc(board.periodMonth) + ' for this metric</button>' : '';
+
+  return '<article class="gc' + cls + '" style="--i:' + index + '">'
+    + '<div class="gc-top"><div style="min-width:0">'
+    + '<button class="gn" type="button" onclick="openGoalDetail(\'' + esc(item.goalId) + '\')">' + esc(item.metricName) + '</button>'
+    + '<div class="gk">' + esc(item.kindLabel) + '</div>' + siteLine + '</div></div>'
+    + perfTrajectory(item, {})
+    + '<div class="gfoot">' + big + perfStatusPill(result) + '</div>'
+    + (staleNote || '<div class="trend">' + perfTrendText(result, item.metricType) + '</div>')
+    /* Guidance: the quiet hook that the manual has something for this card. */
+    + improveCardHook(item)
+    + footAction
+    + '</article>';
+}
+
+function perfMonthOf(period) {
+  var names = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  return names[Number(String(period).split('-')[1]) - 1] || period;
+}
+
+/* ============================ entry worksheet ============================ */
+
+function renderEntry() {
+  var token = perfShowSkeleton();
+  run('performance.entry', {}).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    PERF.entry = result;
+    PERF.drafts = {};
+    result.items.forEach(function (item) { PERF.drafts[item.goalId] = perfDraftFrom(item); });
+    perfSetMain(perfEntryHtml(result));
+  });
+}
+
+function perfDraftFrom(item) {
+  var current = item.current;
+  if (!current) { return { numerator: '', denominator: '', value: '', noData: false, saved: false }; }
+  return {
+    numerator: current.numerator === null ? '' : String(current.numerator),
+    denominator: current.denominator === null ? '' : String(current.denominator),
+    value: current.value === null ? '' : String(current.value),
+    noData: !!current.noData,
+    saved: true
+  };
+}
+
+function perfDraftFilled(item) {
+  var draft = PERF.drafts[item.goalId];
+  if (!draft) { return false; }
+  if (draft.noData) { return true; }
+  if (item.metricType === 'percentage') { return draft.numerator !== '' && draft.denominator !== ''; }
+  return draft.value !== '';
+}
+
+/** The same refusals the server applies, said early so nobody types a whole
+    month and then gets told at the end. The server still checks all of them. */
+function perfDraftError(item) {
+  var draft = PERF.drafts[item.goalId];
+  if (!draft || draft.noData) { return null; }
+  if (item.metricType === 'percentage') {
+    if (draft.numerator === '' && draft.denominator === '') { return null; }
+    if (draft.numerator === '' || draft.denominator === '') { return 'Both numbers are needed. Enter how many, out of how many.'; }
+    var numerator = Number(draft.numerator), denominator = Number(draft.denominator);
+    if (!isFinite(numerator) || !isFinite(denominator) || draft.numerator.trim() === '' || draft.denominator.trim() === '') { return 'Use digits only.'; }
+    if (numerator < 0 || denominator < 0) { return 'Numbers cannot be negative.'; }
+    if (denominator === 0) { return 'The second number cannot be zero. If nobody was eligible this month, tick the no-data box instead.'; }
+    if (numerator > denominator) { return 'The first number cannot be larger than the second. You entered ' + numerator + ' out of ' + denominator + '.'; }
+    return null;
+  }
+  if (draft.value === '') { return null; }
+  var value = Number(draft.value);
+  if (!isFinite(value) || draft.value.trim() === '') { return 'Use digits only.'; }
+  if (value < 0) { return 'This number cannot be negative.'; }
+  return null;
+}
+
+function perfDraftValue(item) {
+  var draft = PERF.drafts[item.goalId];
+  if (item.metricType === 'percentage') { return (Number(draft.numerator) / Number(draft.denominator)) * 100; }
+  return Number(draft.value);
+}
+
+function perfEntryHtml(sheet) {
+  var siteChooser = sheet.sites.length > 1
+    ? '<div class="field" style="margin-bottom:18px"><label for="entrySite">Which site</label>'
+      + '<select id="entrySite" onchange="perfSwitchSite()">' + sheet.sites.map(function (site) {
+        return '<option value="' + esc(site) + '"' + (site === sheet.site ? ' selected' : '') + '>' + esc(site) + '</option>';
+      }).join('') + '</select></div>'
+    : '';
+
+  return '<div class="page-head"><div class="page-head-copy">'
+    + '<div class="crumb">' + esc(sheet.region ? sheet.region + ' / ' + sheet.site : sheet.site) + '</div>'
+    + '<h1>Enter ' + esc(sheet.periodLabel) + '</h1>'
+    + '<p class="sub">Type this month\'s numbers. Nothing is sent until you press Save, and then it all goes at once.'
+    + (sheet.late ? ' Entry closed on ' + esc(sheet.entryClosesOnLabel) + ', so this will be recorded as a late entry.' : '') + '</p>'
+    + '</div></div>'
+    + '<div class="sheet">' + siteChooser
+    + (sheet.items.length
+      ? '<div class="prog"><div class="track"><i id="entryBar" style="width:0%"></i></div><span id="entryCount"></span></div>'
+        + '<div id="entryBands">' + sheet.items.map(perfEntryBand).join('') + '</div>'
+        + '<div class="savebar"><div><b id="entryRemaining"></b>'
+        + '<small>All ' + perfPlural(sheet.items.length, 'number saves', 'numbers save') + ' together in one go, so nothing lands half finished.</small></div>'
+        + '<button class="btn btn-primary" id="entrySave" type="button" onclick="perfSaveMonth()">Save ' + esc(sheet.periodMonth) + '</button>'
+        + '</div>'
+      : '<div class="card empty"><h3>No goals are set for ' + esc(sheet.site) + '</h3><p style="margin-top:8px">There is nothing to enter until somebody sets a goal for this site.</p></div>')
+    + '</div>';
+}
+
+function perfEntryBand(item) {
+  var draft = PERF.drafts[item.goalId];
+  var error = perfDraftError(item);
+  var filled = perfDraftFilled(item);
+  var previous = item.previous
+    ? esc(item.previous.month) + ' was ' + esc(perfFmt(item.metricType, item.previous.value)) + '. '
+    : 'No history yet. ';
+
+  var inputs;
+  if (item.metricType === 'percentage') {
+    inputs = '<div class="inp">'
+      + '<input type="text" inputmode="decimal" aria-label="' + esc(item.numeratorLabel) + '" id="in-num-' + esc(item.goalId) + '"'
+      + ' value="' + esc(draft.numerator) + '"' + (draft.noData ? ' disabled' : '') + ' oninput="perfOnEntryInput(\'' + esc(item.goalId) + '\',\'numerator\',this.value)">'
+      + '<span class="of">of</span>'
+      + '<input type="text" inputmode="decimal" aria-label="' + esc(item.denominatorLabel) + '" id="in-den-' + esc(item.goalId) + '"'
+      + ' value="' + esc(draft.denominator) + '"' + (draft.noData ? ' disabled' : '') + ' oninput="perfOnEntryInput(\'' + esc(item.goalId) + '\',\'denominator\',this.value)">'
+      + '</div>'
+      + '<div class="live"><span class="unit">' + esc(item.numeratorLabel) + ' &middot; ' + esc(item.denominatorLabel) + '</span>'
+      + '<span class="calc tnum" id="calc-' + esc(item.goalId) + '"></span></div>';
+  } else {
+    inputs = '<div class="inp">'
+      + '<input type="text" inputmode="decimal" aria-label="' + esc(item.metricName) + '" id="in-val-' + esc(item.goalId) + '"'
+      + ' value="' + esc(draft.value) + '"' + (draft.noData ? ' disabled' : '') + ' oninput="perfOnEntryInput(\'' + esc(item.goalId) + '\',\'value\',this.value)">'
+      + '<span class="unit">' + esc(item.unit || '') + '</span></div>';
+    /* No live row here on purpose. The commitment is already stated above the
+       input, and echoing the number somebody just typed tells them nothing. The
+       status pill carries the live reading. */
+  }
+
+  return '<section class="band' + (error ? ' bad' : (filled ? '' : ' todo')) + '" id="band-' + esc(item.goalId) + '">'
+    + '<div class="bt"><div><div class="bn">' + esc(item.metricName) + '</div>'
+    + '<div class="bh">' + previous + esc(item.commitment) + '.</div></div>'
+    + '<span id="pill-' + esc(item.goalId) + '">' + perfStatusPill(item.result) + '</span></div>'
+    + inputs
+    + '<div id="err-' + esc(item.goalId) + '">' + (error ? '<div class="err"><b>&times;</b><span>' + esc(error) + '</span></div>' : '') + '</div>'
+    + '<label class="nodata"><input type="checkbox" id="nd-' + esc(item.goalId) + '"' + (draft.noData ? ' checked' : '')
+    + ' onchange="perfOnEntryNoData(\'' + esc(item.goalId) + '\',this.checked)">'
+    + '<span>There is genuinely no data for ' + esc(PERF.entry.periodMonth) + ', and that is not the same as zero</span></label>'
+    + '</section>';
+}
+
+/**
+ * Typing updates only the parts of the band that changed. Rebuilding the whole
+ * worksheet on every keystroke would lose the caret and replay the entrance
+ * animation, so it does not happen.
+ */
+function perfOnEntryInput(goalId, field, value) {
+  var draft = PERF.drafts[goalId];
+  if (!draft) { return; }
+  draft[field] = value;
+  perfRefreshBand(goalId);
+  perfRefreshProgress();
+}
+function perfOnEntryNoData(goalId, checked) {
+  var draft = PERF.drafts[goalId];
+  if (!draft) { return; }
+  draft.noData = checked;
+  var item = perfEntryItem(goalId);
+  ['num', 'den', 'val'].forEach(function (part) {
+    var input = document.getElementById('in-' + part + '-' + goalId);
+    if (input) { input.disabled = checked; }
+  });
+  if (checked && item) {
+    draft.numerator = ''; draft.denominator = ''; draft.value = '';
+    ['num', 'den', 'val'].forEach(function (part) {
+      var input = document.getElementById('in-' + part + '-' + goalId);
+      if (input) { input.value = ''; }
+    });
+  }
+  perfRefreshBand(goalId);
+  perfRefreshProgress();
+}
+function perfEntryItem(goalId) {
+  return (PERF.entry.items || []).filter(function (item) { return item.goalId === goalId; })[0] || null;
+}
+
+function perfRefreshBand(goalId) {
+  var item = perfEntryItem(goalId);
+  if (!item) { return; }
+  var draft = PERF.drafts[goalId], error = perfDraftError(item), filled = perfDraftFilled(item);
+
+  var band = document.getElementById('band-' + goalId);
+  if (band) { band.className = 'band' + (error ? ' bad' : (filled ? '' : ' todo')); }
+
+  [['num', 'numerator'], ['den', 'denominator'], ['val', 'value']].forEach(function (pair) {
+    var input = document.getElementById('in-' + pair[0] + '-' + goalId);
+    if (!input) { return; }
+    input.className = error ? 'bad' : (draft[pair[1]] !== '' ? 'filled' : '');
+  });
+
+  var errorBox = document.getElementById('err-' + goalId);
+  if (errorBox) {
+    errorBox.innerHTML = error ? '<div class="err"><b>&times;</b><span>' + esc(error) + '</span></div>' : '';
+  }
+
+  var calc = document.getElementById('calc-' + goalId);
+  var pill = document.getElementById('pill-' + goalId);
+  if (draft.noData) {
+    if (calc) { calc.textContent = ''; }
+    if (pill) { pill.innerHTML = perfStatusPill({ status: 'Not yet measured', noData: true }); }
+    return;
+  }
+  if (error || !filled) {
+    if (calc) { calc.textContent = ''; }
+    if (pill) { pill.innerHTML = perfStatusPill(item.result); }
+    return;
+  }
+  var value = perfDraftValue(item);
+  if (calc) {
+    calc.textContent = item.metricType === 'percentage'
+      ? perfFmt(item.metricType, value)
+      : perfFmt(item.metricType, value);
+  }
+  if (pill) { pill.innerHTML = perfStatusPill({ status: perfPreviewStatus(item.preview, value) }); }
+}
+
+function perfRefreshProgress() {
+  var items = PERF.entry.items || [];
+  var filled = items.filter(perfDraftFilled).length;
+  var bar = document.getElementById('entryBar');
+  var count = document.getElementById('entryCount');
+  var remaining = document.getElementById('entryRemaining');
+  if (bar) { bar.style.width = (items.length ? Math.round((filled / items.length) * 100) : 0) + '%'; }
+  if (count) { count.textContent = filled + ' of ' + items.length + ' entered'; }
+  if (remaining) {
+    var left = items.length - filled;
+    remaining.textContent = left === 0 ? 'Everything is filled in' : perfPlural(left, 'metric still empty', 'metrics still empty');
+  }
+}
+
+function perfSwitchSite() {
+  var select = document.getElementById('entrySite');
+  if (!select) { return; }
+  var token = perfShowSkeleton();
+  run('performance.entry', { site: select.value }).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    PERF.entry = result;
+    PERF.drafts = {};
+    result.items.forEach(function (item) { PERF.drafts[item.goalId] = perfDraftFrom(item); });
+    perfSetMain(perfEntryHtml(result));
+  });
+}
+
+function perfSaveMonth() {
+  if (PERF.saving) { return; }
+  var items = PERF.entry.items || [];
+  var broken = items.filter(function (item) { return !!perfDraftError(item); });
+  if (broken.length) {
+    toast(perfPlural(broken.length, 'number needs', 'numbers need') + ' fixing before this can save.', true);
+    var first = document.getElementById('band-' + broken[0].goalId);
+    if (first && first.scrollIntoView) { first.scrollIntoView({ block: 'center' }); }
+    return;
+  }
+  var empty = items.filter(function (item) { return !perfDraftFilled(item); });
+  if (empty.length) { perfConfirmPartial(empty.length); return; }
+  perfCommitMonth();
+}
+
+function perfConfirmPartial(count) {
+  showDialog('<h2 id="dialogTitle">Save with ' + perfPlural(count, 'metric', 'metrics') + ' still empty?</h2>'
+    + '<p class="muted">You can come back and finish later. Anything left empty stays visibly unreported on the dashboard rather than counting as zero.</p>'
+    + '<div class="actions" style="justify-content:flex-end;margin-top:20px">'
+    + '<button class="btn btn-ghost" type="button" onclick="closeDialog()">Keep filling it in</button>'
+    + '<button class="btn btn-primary" type="button" onclick="perfCommitMonth()">Save what I have</button></div>');
+}
+
+function perfCommitMonth() {
+  closeDialog();
+  PERF.saving = true;
+  var button = document.getElementById('entrySave');
+  var items = PERF.entry.items || [];
+  var entries = items.filter(perfDraftFilled).map(function (item) {
+    var draft = PERF.drafts[item.goalId];
+    return {
+      goalId: item.goalId,
+      noData: draft.noData,
+      numerator: draft.noData ? null : draft.numerator,
+      denominator: draft.noData ? null : draft.denominator,
+      value: draft.noData ? null : draft.value
+    };
+  });
+  if (!entries.length) { PERF.saving = false; toast('There is nothing to save yet.', true); return; }
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = '<span class="savespin"></span> Saving ' + perfPlural(entries.length, 'number', 'numbers');
+  }
+  /* One request, one write, one lock. The key makes a retry after E_BUSY safe:
+     the second attempt finds its own key already stored and changes nothing. */
+  var payload = { site: PERF.entry.site, period: PERF.entry.period, submissionKey: PERF.entry.submissionKey || (PERF.entry.submissionKey = makeSubmissionKey_()), entries: entries };
+  run('actual.saveMonth', payload).then(function (result) {
+    PERF.saving = false;
+    if (!result.ok) {
+      var again = document.getElementById('entrySave');
+      if (again) { again.disabled = false; again.textContent = 'Save ' + PERF.entry.periodMonth; }
+      toast(friendly(result), true);
+      return;
+    }
+    toast(result.duplicate
+      ? PERF.entry.periodLabel + ' was already saved for ' + PERF.entry.site + '.'
+      : PERF.entry.periodLabel + ' saved for ' + PERF.entry.site + '.');
+    perfRefreshBootCount();
+    go('performance');
+  });
+}
+
+/** Keep the sidebar count honest after a save without a second round trip. */
+function perfRefreshBootCount() {
+  run('bootstrap').then(function (result) {
+    if (!result.ok) { return; }
+    BOOT.performance = result.performance;
+    BOOT.nav = result.nav;
+    renderNav();
+  });
+}
+
+/* ============================ region rollup ============================ */
+
+function renderRollup() {
+  var token = perfShowSkeleton();
+  run('performance.rollup', {}).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    PERF.rollup = result;
+    perfSetMain(perfRollupHtml(result));
+  });
+}
+
+function perfRollupHtml(rollup) {
+  var blocks = rollup.blocks.map(perfRollupBlock).join('');
+  return '<div class="page-head"><div class="page-head-copy">'
+    + '<div class="crumb">' + esc(rollup.scopeName) + '</div>'
+    + '<h1>How the ' + esc(rollup.periodMonth) + ' figure is worked out</h1>'
+    + '<p class="sub">Every rolled-up number shows the sites it came from and the arithmetic that produced it. Nothing here is a black box.</p>'
+    + '</div></div>'
+    + (blocks || '<div class="card empty"><h3>Nothing reported for ' + esc(rollup.periodMonth) + ' yet</h3>'
+      + '<p style="margin-top:8px">Once sites start entering numbers, this page shows how they add up.</p></div>');
+}
+
+function perfRollupBlock(block) {
+  var metric = block.metric;
+  var rows = block.parts.map(function (part) {
+    var shown = metric.metricType === 'percentage'
+      ? part.numerator + ' of ' + part.denominator + '  (' + perfFmt(metric.metricType, part.value) + ')'
+      : perfFmt(metric.metricType, part.value);
+    return '<div class="row"><span>' + esc(part.site) + '</span><span class="tnum">' + esc(shown) + '</span></div>';
+  }).join('');
+
+  var total = '';
+  if (block.kind === 'weighted') {
+    total = '<div class="tot"><span>Region total</span><span class="tnum">'
+      + esc(block.numerator + ' of ' + block.denominator + '  =  ' + perfFmt(metric.metricType, block.total)) + '</span></div>';
+  } else if (block.kind === 'sum') {
+    total = '<div class="tot"><span>Region total</span><span class="tnum">' + esc(perfFmt(metric.metricType, block.total)) + '</span></div>';
+  }
+
+  var notes = '';
+  if (block.kind === 'weighted' && block.parts.length > 1) {
+    var sizes = block.parts.map(function (part) { return Number(part.denominator); });
+    notes += '<div class="note" style="margin-top:12px"><span>Averaging the site percentages would give '
+      + esc(perfFmt(metric.metricType, block.naiveAverage)) + ', which is wrong. It treats a site with '
+      + Math.min.apply(null, sizes) + ' people as equal to one with ' + Math.max.apply(null, sizes)
+      + '. The Hub adds the people, not the percentages.</span></div>';
+  }
+  if (block.kind === 'not-aggregatable') {
+    notes += '<div class="note" style="margin-top:12px"><span>' + esc(block.caveat) + '</span></div>';
+  }
+  if (block.skipped && block.skipped.length) {
+    notes += '<div class="note" style="margin-top:12px"><span>'
+      + perfPlural(block.skipped.length, 'site reported', 'sites reported') + ' genuinely no data this month. '
+      + 'Those sites are left out of the total entirely rather than counted as zero.</span></div>';
+  }
+  if (block.missing && block.missing.length) {
+    notes += '<div class="note" style="margin-top:12px"><span>No number yet from ' + esc(block.missing.join(', '))
+      + '. This total covers only the sites that have reported, so it will move when they do.</span></div>';
+  }
+
+  return '<div class="card" style="margin-bottom:14px">'
+    + '<h3>' + esc(metric.name) + '</h3>'
+    + (block.parts.length
+      ? '<div class="explain">' + rows + total
+        + (block.formula ? '<div class="formula">' + esc(block.formula) + '</div>' : '') + '</div>'
+      : '<p class="muted-sm" style="margin-top:8px">No site has reported this metric for the month.</p>')
+    + notes + '</div>';
+}
+
+/* ============================ goal detail ============================ */
+
+function openGoalDetail(goalId) {
+  var token = perfShowSkeleton();
+  run('goal.get', { goalId: goalId }).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    PERF.goal = result;
+    perfSetMain(perfGoalDetailHtml(result));
+  });
+}
+
+function perfGoalDetailHtml(detail) {
+  var item = detail.item, result = item.result;
+  var hero = result.latestPeriod === detail.period && result.status !== 'Not reported' && result.status !== 'Insufficient data' && !result.noData
+    ? '<div class="now tnum" style="font-size:34px;margin-top:6px" data-count="' + (Math.round(Number(result.latestValue) * 10) / 10) + '" data-count-format="' + esc(item.metricType) + '">' + esc(perfFmt(item.metricType, 0)) + '</div>'
+    : '<div class="now quiet" style="font-size:22px;margin-top:6px">' + (result.noData ? 'No data reported' : 'Not entered') + '</div>';
+
+  var history = detail.history.map(function (entry) {
+    if (entry.superseded) {
+      return '<li class="corr"><strong>' + esc(entry.periodLabel) + ' corrected</strong>'
+        + '<span class="hv"><span class="struck">' + esc(perfFmt(item.metricType, entry.value)) + '</span> replaced on ' + esc(String(entry.replacedOn).slice(0, 10)) + '</span>'
+        + '<small>Reason given: ' + esc(entry.replacedReason || 'not recorded') + '</small></li>';
+    }
+    var shown = entry.noData
+      ? 'Reported as genuinely no data'
+      : perfFmt(item.metricType, entry.value) + (perfHasParts_(item, entry) ? '  (' + entry.numerator + ' of ' + entry.denominator + ')' : '');
+    var correctionNote = entry.supersedesActualId
+      ? '<small>Correction. Reason: ' + esc(entry.correctionReason || 'not recorded')
+        + (entry.approvedBy ? '. Approved by ' + esc(entry.approvedBy) : '') + '</small>'
+      : '';
+    var canCorrect = detail.canEnter && !entry.noData
+      ? ' <button class="btn btn-ghost btn-sm" type="button" onclick="openCorrectionDialog(\'' + esc(entry.actualId) + '\')">Correct</button>'
+      : '';
+    return '<li><strong>' + esc(entry.periodLabel) + canCorrect + '</strong>'
+      + '<span class="hv">' + esc(shown) + '</span>'
+      + '<small>Entered by ' + esc(entry.enteredBy) + ' on ' + esc(String(entry.enteredAt).slice(0, 10)) + '</small>'
+      + correctionNote + '</li>';
+  }).join('');
+
+  return '<div class="page-head"><div class="page-head-copy">'
+    + '<div class="crumb">' + esc(item.site) + '</div>'
+    + '<h1>' + esc(item.metricName) + '</h1>'
+    + '<p class="sub">' + esc(item.kindLabel) + '. ' + esc(item.commitment) + '. Owned by ' + esc(item.owner) + '.</p>'
+    + '</div><div class="head-actions">'
+    + '<button class="btn btn-ghost" type="button" onclick="go(\'performance\')">Back</button>'
+    + '</div></div>'
+    /* Guidance: the number and what the manual says about it, side by side. The
+       chart stays the dominant element; the guidance is its peer, never an
+       annotation on top of it. */
+    + '<div class="goal-grid">'
+    + '<div class="card">'
+    + '<div style="display:flex;gap:20px;align-items:flex-end;justify-content:space-between;flex-wrap:wrap">'
+    + '<div><div class="bl">' + esc(detail.periodMonth) + '</div>' + hero
+    + '<div class="trend">' + perfTrendText(result, item.metricType) + '</div></div>'
+    + '<div>' + perfStatusPill(result) + '</div></div>'
+    + perfTrajectory(item, { axis: true })
+    + '<div class="formula">' + esc(perfExplainStatus(detail)) + '</div>'
+    + '<div class="explain"><div class="row"><span>On track needs a score of</span><span class="tnum">' + Math.round(result.onTrackPace * 100) + '%</span></div>'
+    + '<div class="row"><span>At risk down to</span><span class="tnum">' + Math.round(result.atRiskPace * 100) + '%</span></div>'
+    + '<div class="row"><span>Below that</span><span>Off track</span></div></div>'
+    + '</div>'
+    + improveGuidancePanelHtml(detail)
+    + '</div>'
+    + '<div class="card"><h3>Every number ever reported</h3>'
+    + '<p class="muted-sm" style="margin-top:4px">Corrections never overwrite. The old number stays visible with the reason it was replaced.</p>'
+    + (history ? '<ul class="history">' + history + '</ul>' : '<p class="muted-sm" style="margin-top:12px">Nothing has been reported against this goal yet.</p>')
+    + '</div>';
+}
+
+function perfExplainStatus(detail) {
+  var item = detail.item, result = item.result, month = detail.periodMonth;
+  if (result.status === 'Not yet measured' && result.noData) {
+    return 'Somebody confirmed there is genuinely nothing to report for ' + month + '. That is a real answer and it is not the same as zero, so the Hub reports no score rather than a bad one.';
+  }
+  if (result.status === 'Not yet measured') {
+    return 'Nothing has ever been reported against this goal, so the Hub reports no status rather than guessing one.';
+  }
+  if (result.status === 'Not reported') {
+    return 'Nobody has entered a ' + month + ' number. The Hub will not carry ' + perfMonthOf(result.latestPeriod) + '\'s figure forward and call the month fine.';
+  }
+  if (result.status === 'Insufficient data') {
+    return 'The last number is ' + perfPlural(result.stale, 'month', 'months') + ' old, so the status is stale rather than green.';
+  }
+  if (item.goalKind === 'journey') {
+    return 'The journey is ' + Math.round(result.progress * 100) + '% done and the time to the deadline is '
+      + Math.round(result.elapsed * 100) + '% gone, which scores ' + Math.round(result.ratio * 100)
+      + '%. On track needs ' + Math.round(result.onTrackPace * 100) + '%.';
+  }
+  return month + '\'s ' + perfFmt(item.metricType, result.latestValue) + ' against a line of '
+    + perfFmt(item.metricType, item.target) + ' scores ' + Math.round(result.ratio * 100) + '%.';
+}
+
+/* ============================ corrections ============================ */
+
+function openCorrectionDialog(actualId) {
+  var detail = PERF.goal;
+  if (!detail) { return; }
+  var entry = detail.history.filter(function (row) { return row.actualId === actualId; })[0];
+  if (!entry) { return; }
+  var item = detail.item;
+  var isPercentage = item.metricType === 'percentage';
+  var reasons = detail.correctionReasons.map(function (reason) {
+    return '<option value="' + esc(reason) + '">' + esc(reason) + '</option>';
+  }).join('');
+
+  showDialog('<h2 id="dialogTitle">Correct the ' + esc(entry.periodLabel) + ' number</h2>'
+    + '<p class="muted">The original stays in the record. Your correction is added on top with the reason, so the history always shows both.</p>'
+    + '<form id="correctionForm" onsubmit="perfSaveCorrection(event)">'
+    + '<div class="field"><label>What is recorded now</label>'
+    + '<p class="muted">' + esc(perfFmt(item.metricType, entry.value))
+    + (perfHasParts_(item, entry) ? ' (' + entry.numerator + ' of ' + entry.denominator + ')' : '')
+    + ', entered by ' + esc(entry.enteredBy) + ' on ' + esc(String(entry.enteredAt).slice(0, 10)) + '.</p></div>'
+    + (isPercentage
+      ? '<div class="grid g-2"><div class="field"><label for="cfNum">' + esc(item.numeratorLabel) + ' (required)</label>'
+        + '<input id="cfNum" type="text" inputmode="decimal" value="' + esc(entry.numerator === null ? '' : entry.numerator) + '" required></div>'
+        + '<div class="field"><label for="cfDen">' + esc(item.denominatorLabel) + ' (required)</label>'
+        + '<input id="cfDen" type="text" inputmode="decimal" value="' + esc(entry.denominator === null ? '' : entry.denominator) + '" required></div></div>'
+      : '<div class="field"><label for="cfVal">The corrected number (required)</label>'
+        + '<input id="cfVal" type="text" inputmode="decimal" value="' + esc(entry.value === null ? '' : entry.value) + '" required></div>')
+    + '<div class="field"><label for="cfReason">Why is it changing (required)</label>'
+    + '<select id="cfReason">' + reasons + '</select></div>'
+    + '<div class="field"><label for="cfDetail">Say a little more (required)</label>'
+    + '<textarea id="cfDetail" rows="2" placeholder="for example, 4 clients were counted twice" required></textarea></div>'
+    + '<div class="actions" style="justify-content:flex-end">'
+    + '<button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button>'
+    + '<button class="btn btn-primary" id="cfSave" type="submit">Save correction</button></div>'
+    + '</form>');
+  document.getElementById('correctionForm').dataset.actualId = actualId;
+}
+
+function perfSaveCorrection(event) {
+  event.preventDefault();
+  var form = event.currentTarget, button = document.getElementById('cfSave'), seq = dialogSeq_();
+  button.disabled = true;
+  button.textContent = 'Saving...';
+  var payload = {
+    actualId: form.dataset.actualId, submissionKey: dialogCommandKey_(),
+    correctionReason: value_('cfReason') + ': ' + value_('cfDetail'),
+    numerator: value_('cfNum'),
+    denominator: value_('cfDen'),
+    value: value_('cfVal')
+  };
+  run('actual.correct', payload).then(function (result) {
+    if (!result.ok) {
+      var again = document.getElementById('cfSave');
+      if (again) { again.disabled = false; again.textContent = 'Save correction'; }
+      dialogError(seq, friendly(result));
+      return;
+    }
+    closeDialogIf(seq);
+    toast(result.approved
+      ? 'Correction recorded and approved by you. The old number stays visible.'
+      : 'Correction recorded. The old number stays visible in the history.');
+    openGoalDetail(PERF.goal.item.goalId);
+  });
+}
+
+/* ============================ goals list and wizard ============================ */
+
+function renderGoals() {
+  var token = perfShowSkeleton();
+  run('goal.list', {}).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    PERF.goals = result;
+    perfSetMain(perfGoalsHtml(result));
+  });
+}
+
+function perfGoalsHtml(list) {
+  var rows = list.items.map(function (item, index) {
+    var retireButton = list.canManage
+      ? ' <button class="btn btn-ghost btn-sm" type="button" onclick="openRetireGoal(' + index + ')">' + (item.retired ? 'Reinstate' : 'Retire') + '</button>'
+      : '';
+    return '<tr' + (item.retired ? ' style="opacity:.55"' : '') + '><td><b>' + esc(item.metricName) + '</b>'
+      + '<div class="gk">' + esc(item.kindLabel) + (item.retired ? ' &middot; retired' : '') + '</div></td>'
+      + '<td>' + esc(item.site) + '</td>'
+      + '<td class="tnum">' + esc(item.commitment) + '</td>'
+      + '<td>' + (item.retired ? '<span class="pill p-none">Retired</span>' : perfStatusPill(item.result)) + '</td>'
+      + '<td>' + esc(item.owner) + '</td>'
+      + '<td><button class="btn btn-ghost btn-sm" type="button" onclick="openGoalDetail(\'' + esc(item.goalId) + '\')">Open</button>'
+      + retireButton + '</td></tr>';
+  }).join('');
+
+  return '<div class="page-head"><div class="page-head-copy">'
+    + '<div class="crumb">Set up</div><h1>Goals</h1>'
+    + '<p class="sub">A goal is a metric plus a commitment. Every goal states which kind it is, so the Hub knows how to judge it.</p>'
+    + '</div><div class="head-actions">'
+    + (list.canManage ? '<button class="btn btn-primary" type="button" onclick="perfStartGoalWizard()">New goal</button>' : '')
+    + '</div></div>'
+    + (list.items.length
+      ? '<div class="tablewrap"><table><thead><tr><th>Goal</th><th>Site</th><th>Commitment</th><th>' + esc(list.periodLabel) + ' status</th><th>Owner</th><th></th></tr></thead>'
+        + '<tbody>' + rows + '</tbody></table></div>'
+      : '<div class="card empty"><h3>No goals yet</h3><p style="margin-top:8px">A goal names a metric, a site and what success looks like.</p></div>');
+}
+
+/**
+ * Retiring a goal stops it being judged from now on. It deletes nothing: every
+ * number ever reported against it stays in the record and the goal can be
+ * brought back, which is why the list keeps showing it greyed out.
+ */
+function openRetireGoal(index) {
+  var goal = PERF.goals.items[index];
+  PERF.retiringGoalVersion = goal.version;
+  var body = goal.retired
+    ? esc(goal.metricName) + ' at ' + esc(goal.site) + ' starts being judged again from this month, and reappears on the dashboard and in the worksheet.'
+    : esc(goal.metricName) + ' at ' + esc(goal.site) + ' stops being judged and leaves the dashboard and the worksheet. Every number already reported against it stays exactly where it is, and you can bring it back later.';
+
+  showDialog('<h2 id="dialogTitle">' + (goal.retired ? 'Reinstate this goal?' : 'Retire this goal?') + '</h2>'
+    + '<p class="muted">' + body + '</p>'
+    + '<div class="actions" style="justify-content:flex-end;margin-top:20px">'
+    + '<button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button>'
+    + '<button class="btn btn-primary" id="grSave" type="button" onclick="perfRetireGoal(\'' + esc(goal.goalId) + '\',' + (goal.retired ? 'true' : 'false') + ')">'
+    + (goal.retired ? 'Reinstate it' : 'Retire it') + '</button></div>');
+}
+
+function perfRetireGoal(goalId, reinstate) {
+  var button = document.getElementById('grSave'), seq = dialogSeq_();
+  if (button) { button.disabled = true; button.textContent = 'Saving...'; }
+  run('goal.retire', { goalId: goalId, version: PERF.retiringGoalVersion, active: reinstate, submissionKey: dialogCommandKey_() }).then(function (result) {
+    if (!result.ok) { if (button) { button.disabled = false; button.textContent = 'Retry change'; } dialogError(seq, friendly(result)); return; }
+    closeDialogIf(seq);
+    toast(reinstate ? 'Goal reinstated.' : 'Goal retired. Nothing was deleted.');
+    renderGoals();
+  });
+}
+
+var PERF_KINDS = [
+  { id: 'period', title: 'A target every period', detail: 'The same line to hit each month. Best for volume and coverage work.', example: 'Serve 40 clients each month' },
+  { id: 'journey', title: 'A journey to a date', detail: 'Move from where you are now to where you want to be, by a deadline.', example: 'Cut no-shows from 22% to 12% by 30 June 2027' },
+  { id: 'hold', title: 'Hold a level', detail: 'Stay at or above, or below, a line. Nothing to improve, everything to protect.', example: 'Keep staff certification at or above 95%' }
+];
+
+function perfStartGoalWizard() {
+  PERF.wizard = { submissionKey: makeSubmissionKey_(),
+    step: 1, metricId: '', site: '', goalKind: 'period',
+    target: '', baseline: '', startDate: '', targetDate: '',
+    onTrackPace: String(Math.round(BOOT.performance.defaultThresholds.onTrackPace * 100)),
+    atRiskPace: String(Math.round(BOOT.performance.defaultThresholds.atRiskPace * 100)),
+    owner: '', ownerEmail: ''
+  };
+  perfSetMain(perfWizardHtml());
+}
+
+function perfWizardField(field, value) {
+  PERF.wizard[field] = value;
+  /* The goal number feeds the worked example too, so changing it refreshes the
+     example in place rather than waiting for a step change. */
+  perfRefreshWorkedExample();
+}
+function perfRefreshWorkedExample() {
+  var box = document.getElementById('wzWorked');
+  if (box) { box.textContent = perfWorkedExample(PERF.wizard, perfWizardMetric()); }
+}
+function perfWizardKind(kind) {
+  PERF.wizard.goalKind = kind;
+  PERF.wizard.target = '';
+  perfSetPlain(perfWizardHtml());
+}
+function perfWizardStep(step) {
+  var wizard = PERF.wizard;
+  if (step === 2 && (!wizard.metricId || !wizard.site)) {
+    toast('Choose a metric and a site first.', true);
+    return;
+  }
+  if (step === 3 && !String(wizard.target).trim()) {
+    toast('This goal needs a number before it can be reviewed.', true);
+    return;
+  }
+  wizard.step = step;
+  perfSetPlain(perfWizardHtml());
+}
+
+function perfWizardHtml() {
+  var wizard = PERF.wizard, list = PERF.goals;
+  var steps = ['Metric and site', 'Kind of goal', 'Owner and review'].map(function (label, index) {
+    var number = index + 1;
+    var state = wizard.step === number ? ' active' : (wizard.step > number ? ' done' : '');
+    return '<div class="step' + state + '"><span class="num">' + (wizard.step > number ? '&check;' : number) + '</span>' + esc(label) + '</div>';
+  }).join('');
+
+  var body;
+  if (wizard.step === 1) { body = perfWizardStep1(list, wizard); }
+  else if (wizard.step === 2) { body = perfWizardStep2(list, wizard); }
+  else { body = perfWizardStep3(list, wizard); }
+
+  return '<div class="page-head"><div class="page-head-copy"><div class="crumb">Set up / Goals</div>'
+    + '<h1>New goal</h1><p class="sub">3 steps. Nothing is saved until the last one.</p></div>'
+    + '<div class="head-actions"><button class="btn btn-ghost" type="button" onclick="go(\'goals\')">Cancel</button></div></div>'
+    + '<div class="stepper">' + steps + '</div>'
+    + '<div class="card" style="max-width:700px">' + body + '</div>';
+}
+
+function perfWizardStep1(list, wizard) {
+  var metrics = list.metrics.map(function (metric) {
+    return '<option value="' + esc(metric.metricId) + '"' + (metric.metricId === wizard.metricId ? ' selected' : '') + '>' + esc(metric.name) + '</option>';
+  }).join('');
+  var sites = list.sites.map(function (site) {
+    return '<option value="' + esc(site) + '"' + (site === wizard.site ? ' selected' : '') + '>' + esc(site) + '</option>';
+  }).join('');
+  return '<h3 style="margin-bottom:4px">What is being measured, and where?</h3>'
+    + '<p class="muted-sm" style="margin-bottom:16px">One goal covers one site. A commitment across a whole network is this same goal set at each site and added up in the rollup, so somebody is accountable for every part of it.</p>'
+    + '<div class="field"><label for="wzMetric">Metric <span class="req">required</span></label>'
+    + '<select id="wzMetric" onchange="perfWizardField(\'metricId\',this.value)"><option value="">Choose a metric</option>' + metrics + '</select></div>'
+    + '<div class="field"><label for="wzSite">Site <span class="req">required</span></label>'
+    + '<select id="wzSite" onchange="perfWizardField(\'site\',this.value)"><option value="">Choose a site</option>' + sites + '</select></div>'
+    + '<div class="actions" style="margin-top:22px"><button class="btn btn-primary" type="button" onclick="perfWizardStep(2)">Continue to the kind of goal</button></div>';
+}
+
+function perfWizardStep2(list, wizard) {
+  var metric = perfWizardMetric();
+  var options = PERF_KINDS.map(function (kind) {
+    return '<button class="kindopt' + (wizard.goalKind === kind.id ? ' on' : '') + '" type="button" onclick="perfWizardKind(\'' + kind.id + '\')">'
+      + '<span class="dot"></span><span style="min-width:0"><b>' + esc(kind.title) + '</b>'
+      + '<span class="kd">' + esc(kind.detail) + '</span><code>' + esc(kind.example) + '</code></span></button>';
+  }).join('');
+
+  var fields;
+  if (wizard.goalKind === 'period') {
+    fields = perfWizardNumber('target', 'The number to hit each month', 'for example, 40', wizard.target);
+  } else if (wizard.goalKind === 'hold') {
+    var direction = metric && metric.direction === 'lower' ? 'at or below' : 'at or above';
+    fields = perfWizardNumber('target', 'The line to hold', 'for example, 95. The Hub reads this as "' + direction + ' 95".', wizard.target);
+  } else {
+    fields = perfWizardNumber('baseline', 'Where you are now, the baseline', 'for example, 22.0', wizard.baseline)
+      + perfWizardNumber('target', 'Where you want to be', 'for example, 12.0', wizard.target)
+      + '<div class="field"><label for="wzStart">Start date <span class="req">required</span></label>'
+      + '<div class="ex">when the journey began</div>'
+      + '<input id="wzStart" type="date" value="' + esc(wizard.startDate) + '" onchange="perfWizardField(\'startDate\',this.value)"></div>'
+      + '<div class="field"><label for="wzTargetDate">By when <span class="req">required</span></label>'
+      + '<div class="ex">the date the commitment is judged against</div>'
+      + '<input id="wzTargetDate" type="date" value="' + esc(wizard.targetDate) + '" onchange="perfWizardField(\'targetDate\',this.value)"></div>';
+  }
+
+  var judged = wizard.goalKind === 'journey'
+    ? 'how much of the journey should be done by now'
+    : 'how close to the line this month\'s number is';
+
+  return '<h3 style="margin-bottom:4px">What kind of commitment is this?</h3>'
+    + '<p class="muted-sm" style="margin-bottom:16px">This decides how the Hub judges the number, so it cannot be changed later without restating the goal.</p>'
+    + '<div class="kindpick">' + options + '</div>'
+    + '<div style="margin-top:22px">' + fields + '</div>'
+    + '<div class="thresholdbox">'
+    + '<b style="font-family:var(--display);color:var(--heading)">When does this goal turn amber, and when does it turn red?</b>'
+    + '<p class="muted-sm" style="margin-top:6px">Judged on ' + esc(judged) + '. These are your numbers, not ours, and they are shown to everyone who reads the goal.</p>'
+    + '<div class="thline">On track at or above <input type="text" inputmode="decimal" value="' + esc(wizard.onTrackPace) + '" aria-label="On track percentage" oninput="perfWizardThreshold(\'onTrackPace\',this.value)"> %'
+    + ' &middot; at risk down to <input type="text" inputmode="decimal" value="' + esc(wizard.atRiskPace) + '" aria-label="At risk percentage" oninput="perfWizardThreshold(\'atRiskPace\',this.value)"> %'
+    + ' &middot; below that, off track</div>'
+    + '<div class="formula" id="wzWorked">' + esc(perfWorkedExample(wizard, metric)) + '</div></div>'
+    + '<div class="actions" style="margin-top:22px">'
+    + '<button class="btn btn-ghost" type="button" onclick="perfWizardStep(1)">Back</button>'
+    + '<button class="btn btn-primary" type="button" onclick="perfWizardStep(3)">Continue to owner and review</button></div>';
+}
+
+/**
+ * A threshold of "90 percent" means nothing until you can see which numbers it
+ * lets through. This turns the 2 lines into 3 real figures in the unit of the
+ * metric, and it updates as the lines are typed.
+ */
+function perfWorkedExample(wizard, metric) {
+  var target = Number(wizard.target);
+  var on = Number(wizard.onTrackPace) / 100, at = Number(wizard.atRiskPace) / 100;
+  if (!isFinite(target) || !target || !isFinite(on) || !isFinite(at) || on <= 0 || at <= 0) {
+    return 'Enter the goal number above and this will show which numbers these lines let through.';
+  }
+  if (at > on) { return 'The at-risk line cannot be higher than the on-track line.'; }
+  var type = metric ? metric.metricType : 'count';
+  if (wizard.goalKind === 'journey') {
+    return 'On a journey these are read against time. Halfway to the deadline, being '
+      + Math.round(on * 50) + '% of the way there reads On track, and being under '
+      + Math.round(at * 50) + '% of the way there reads Off track.';
+  }
+  var lower = metric && metric.direction === 'lower';
+  var atOn = lower ? target / on : target * on;
+  var atRisk = lower ? target / at : target * at;
+  var below = lower ? atRisk * 1.15 : atRisk * 0.85;
+  return 'With these lines, a month of ' + perfFmt(type, atOn) + ' reads On track, '
+    + perfFmt(type, atRisk) + ' reads At risk, and ' + perfFmt(type, below) + ' reads Off track.';
+}
+
+/* Typing a threshold must not rebuild the step, or the caret jumps out of the
+   box being typed in. Only the worked example is refreshed. */
+function perfWizardThreshold(field, value) {
+  PERF.wizard[field] = value;
+  perfRefreshWorkedExample();
+}
+
+function perfWizardNumber(field, label, example, value) {
+  return '<div class="field"><label for="wz-' + field + '">' + esc(label) + ' <span class="req">required</span></label>'
+    + '<div class="ex">' + esc(example) + '</div>'
+    + '<input id="wz-' + field + '" type="text" inputmode="decimal" value="' + esc(value) + '" oninput="perfWizardField(\'' + field + '\',this.value)"></div>';
+}
+function perfWizardMetric() {
+  return (PERF.goals.metrics || []).filter(function (metric) { return metric.metricId === PERF.wizard.metricId; })[0] || null;
+}
+
+function perfWizardStep3(list, wizard) {
+  var metric = perfWizardMetric();
+  var preview = {
+    goalKind: wizard.goalKind,
+    target: Number(wizard.target),
+    baseline: Number(wizard.baseline),
+    metricType: metric ? metric.metricType : 'count',
+    targetDate: wizard.targetDate
+  };
+  var commitment = wizard.goalKind === 'period'
+    ? 'Target ' + perfFmt(preview.metricType, preview.target) + ' each month'
+    : wizard.goalKind === 'hold'
+      ? (metric && metric.direction === 'lower' ? 'Hold at or below ' : 'Hold at or above ') + perfFmt(preview.metricType, preview.target)
+      : perfFmt(preview.metricType, preview.baseline) + ' to ' + perfFmt(preview.metricType, preview.target) + ' by ' + esc(wizard.targetDate);
+
+  return '<h3 style="margin-bottom:4px">Who owns it?</h3>'
+    + '<p class="muted-sm" style="margin-bottom:16px">The owner is who the reminder emails go to when this month\'s number is missing.</p>'
+    + '<div class="field"><label for="wzOwner">Owner name <span class="req">required</span></label>'
+    + '<input id="wzOwner" type="text" value="' + esc(wizard.owner) + '" oninput="perfWizardField(\'owner\',this.value)"></div>'
+    + '<div class="field"><label for="wzOwnerEmail">Owner email <span class="opt">optional</span></label>'
+    + '<div class="ex">without this, nobody is reminded about this goal</div>'
+    + '<input id="wzOwnerEmail" type="email" value="' + esc(wizard.ownerEmail) + '" oninput="perfWizardField(\'ownerEmail\',this.value)"></div>'
+    + '<div class="explain"><div class="row"><span>Metric</span><span>' + esc(metric ? metric.name : 'not chosen') + '</span></div>'
+    + '<div class="row"><span>Site</span><span>' + esc(wizard.site) + '</span></div>'
+    + '<div class="row"><span>Commitment</span><span>' + esc(commitment) + '</span></div>'
+    + '<div class="row"><span>On track at or above</span><span class="tnum">' + esc(wizard.onTrackPace) + '%</span></div>'
+    + '<div class="row"><span>At risk down to</span><span class="tnum">' + esc(wizard.atRiskPace) + '%</span></div></div>'
+    + '<div class="actions" style="margin-top:22px">'
+    + '<button class="btn btn-ghost" type="button" onclick="perfWizardStep(2)">Back</button>'
+    + '<button class="btn btn-primary" id="wzSave" type="button" onclick="perfSaveGoal()">Create this goal</button></div>';
+}
+
+function perfSaveGoal() {
+  var wizard = PERF.wizard, button = document.getElementById('wzSave');
+  if (button) { button.disabled = true; button.textContent = 'Saving...'; }
+  run('goal.save', {
+    submissionKey: wizard.submissionKey, metricId: wizard.metricId, site: wizard.site, goalKind: wizard.goalKind,
+    target: wizard.target, baseline: wizard.baseline,
+    startDate: wizard.startDate, targetDate: wizard.targetDate,
+    onTrackPace: Number(wizard.onTrackPace) / 100, atRiskPace: Number(wizard.atRiskPace) / 100,
+    owner: wizard.owner, ownerEmail: wizard.ownerEmail
+  }).then(function (result) {
+    if (!result.ok) {
+      var again = document.getElementById('wzSave');
+      if (again) { again.disabled = false; again.textContent = 'Create this goal'; }
+      toast(friendly(result), true);
+      return;
+    }
+    toast('Goal created.');
+    go('goals');
+  });
+}
+
+/* ============================ metric library ============================ */
+
+function renderMetrics() {
+  var token = perfShowSkeleton();
+  run('metric.list', {}).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    PERF.metrics = result;
+    perfSetMain(perfMetricsHtml(result));
+  });
+}
+
+function perfMetricsHtml(list) {
+  var rows = list.items.map(function (metric, index) {
+    var retired = metric.active === false || String(metric.active).toUpperCase() === 'FALSE';
+    var entered = metric.metricType === 'percentage'
+      ? esc(metric.numeratorLabel) + ' <span class="of">of</span> ' + esc(metric.denominatorLabel)
+      : '<span class="unit">' + esc(metric.unit || 'a number') + '</span>';
+    return '<tr' + (retired ? ' style="opacity:.55"' : '') + '><td><b>' + esc(metric.name) + '</b>'
+      + (retired ? '<div class="gk">Retired</div>' : '') + '</td>'
+      + '<td style="text-transform:capitalize">' + esc(metric.metricType) + '</td>'
+      + '<td>' + entered + '</td>'
+      + '<td>' + (metric.direction === 'higher' ? 'Higher is better' : 'Lower is better') + '</td>'
+      + '<td class="tnum">' + perfPlural(metric.goalCount, 'goal', 'goals') + '</td>'
+      + '<td>' + (list.canManage
+        ? '<button class="btn btn-ghost btn-sm" type="button" onclick="openMetricForm(' + index + ')">Edit</button> '
+          + '<button class="btn btn-ghost btn-sm" type="button" onclick="openRetireMetric(' + index + ')">' + (retired ? 'Reinstate' : 'Retire') + '</button>'
+        : '') + '</td></tr>';
+  }).join('');
+
+  return '<div class="page-head"><div class="page-head-copy"><div class="crumb">Set up</div><h1>Metric library</h1>'
+    + '<p class="sub">What a measure means, defined once, used by every site. A percentage metric names both of its numbers so regional totals come out right.</p>'
+    + '</div><div class="head-actions">'
+    + (list.canManage ? '<button class="btn btn-primary" type="button" onclick="openMetricForm(null)">New metric</button>' : '')
+    + '</div></div>'
+    + (list.items.length
+      ? '<div class="tablewrap"><table><thead><tr><th>Metric</th><th>Type</th><th>What gets entered</th><th>Direction</th><th>In use</th><th></th></tr></thead>'
+        + '<tbody>' + rows + '</tbody></table></div>'
+      : '<div class="card empty"><h3>No metrics defined yet</h3><p style="margin-top:8px">A metric is what a measure means. Goals are set against it afterwards.</p></div>')
+    + '<div class="note" style="margin-top:16px"><span><b>A metric with history is never deleted.</b> Retiring it stops new goals using it and leaves every number already reported against it intact.</span></div>';
+}
+
+function openMetricForm(index) {
+  var metric = index === null ? { metricType: 'count', direction: 'higher' } : PERF.metrics.items[index];
+  var types = PERF.metrics.metricTypes.map(function (type) {
+    return '<option value="' + esc(type) + '"' + (type === metric.metricType ? ' selected' : '') + '>' + esc(type.charAt(0).toUpperCase() + type.slice(1)) + '</option>';
+  }).join('');
+
+  showDialog('<h2 id="dialogTitle">' + (index === null ? 'New metric' : 'Edit metric') + '</h2>'
+    + '<p class="muted">A percentage names both of its numbers. That is what lets a region add people instead of averaging percentages.</p>'
+    + '<form id="metricForm" onsubmit="perfSaveMetric(event)">'
+    + '<div class="field"><label for="mfName">Name (required)</label>'
+    + '<input id="mfName" maxlength="200" value="' + esc(metric.name || '') + '" required></div>'
+    + '<div class="grid g-2"><div class="field"><label for="mfType">Type</label>'
+    + '<select id="mfType" onchange="perfMetricTypeChanged()"' + (index === null ? '' : ' disabled') + '>' + types + '</select>'
+    + (index === null ? '' : '<div class="ex">The type cannot change once numbers have been reported.</div>') + '</div>'
+    + '<div class="field"><label for="mfDirection">Which way is better</label>'
+    + '<select id="mfDirection"><option value="higher"' + (metric.direction === 'higher' ? ' selected' : '') + '>Higher is better</option>'
+    + '<option value="lower"' + (metric.direction === 'lower' ? ' selected' : '') + '>Lower is better</option></select></div></div>'
+    + '<div id="mfParts">' + perfMetricPartsHtml(metric.metricType, metric) + '</div>'
+    + '<div class="field"><label for="mfDescription">What it means (optional)</label>'
+    + '<textarea id="mfDescription" rows="2">' + esc(metric.description || '') + '</textarea></div>'
+    + '<div class="actions" style="justify-content:flex-end">'
+    + '<button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button>'
+    + '<button class="btn btn-primary" id="mfSave" type="submit">Save metric</button></div></form>');
+  document.getElementById('metricForm').dataset.metricId = index === null ? '' : metric.metricId;
+  document.getElementById('metricForm').dataset.metricType = metric.metricType; document.getElementById('metricForm').dataset.updatedAt = metric.updatedAt || '';
+}
+
+function perfMetricPartsHtml(metricType, metric) {
+  metric = metric || {};
+  if (metricType === 'percentage') {
+    return '<div class="grid g-2"><div class="field"><label for="mfNum">Name of the first number (required)</label>'
+      + '<div class="ex">for example, Clients screened</div>'
+      + '<input id="mfNum" value="' + esc(metric.numeratorLabel || '') + '"></div>'
+      + '<div class="field"><label for="mfDen">Name of the second number (required)</label>'
+      + '<div class="ex">for example, Clients eligible for screening</div>'
+      + '<input id="mfDen" value="' + esc(metric.denominatorLabel || '') + '"></div></div>';
+  }
+  return '<div class="field"><label for="mfUnit">Unit (optional)</label>'
+    + '<div class="ex">for example, clients or days</div>'
+    + '<input id="mfUnit" value="' + esc(metric.unit || '') + '"></div>';
+}
+
+function perfMetricTypeChanged() {
+  var select = document.getElementById('mfType'), parts = document.getElementById('mfParts');
+  if (!select || !parts) { return; }
+  parts.innerHTML = perfMetricPartsHtml(select.value, {});
+}
+
+function perfSaveMetric(event) {
+  event.preventDefault();
+  var form = event.currentTarget, button = document.getElementById('mfSave'), seq = dialogSeq_();
+  button.disabled = true;
+  button.textContent = 'Saving...';
+  var typeSelect = document.getElementById('mfType');
+  run('metric.save', {
+    metricId: form.dataset.metricId, updatedAt: form.dataset.updatedAt, submissionKey: dialogCommandKey_(),
+    name: value_('mfName'),
+    metricType: typeSelect && !typeSelect.disabled ? typeSelect.value : form.dataset.metricType,
+    direction: value_('mfDirection'),
+    unit: value_('mfUnit'),
+    numeratorLabel: value_('mfNum'),
+    denominatorLabel: value_('mfDen'),
+    description: value_('mfDescription')
+  }).then(function (result) {
+    if (!result.ok) {
+      var again = document.getElementById('mfSave');
+      if (again) { again.disabled = false; again.textContent = 'Save metric'; }
+      dialogError(seq, friendly(result));
+      return;
+    }
+    closeDialogIf(seq);
+    toast(result.created ? 'Metric created.' : 'Metric saved.');
+    renderMetrics();
+  });
+}
+
+function openRetireMetric(index) {
+  var metric = PERF.metrics.items[index]; PERF.retiringMetricUpdatedAt = metric.updatedAt;
+  var retired = metric.active === false || String(metric.active).toUpperCase() === 'FALSE';
+  var body = retired
+    ? 'New goals will be able to use ' + esc(metric.name) + ' again.'
+    : (metric.goalCount
+      ? 'It is used by ' + perfPlural(metric.goalCount, 'goal', 'goals') + '. Retiring stops new goals using it. Every number already reported stays exactly where it is, and the existing goals keep working until they are retired themselves.'
+      : 'Nothing uses it yet, so retiring it simply takes it off the list.');
+
+  showDialog('<h2 id="dialogTitle">' + (retired ? 'Reinstate ' : 'Retire ') + esc(metric.name) + '?</h2>'
+    + '<p class="muted">' + body + '</p>'
+    + '<div class="actions" style="justify-content:flex-end;margin-top:20px">'
+    + '<button class="btn btn-ghost" type="button" onclick="closeDialog()">Cancel</button>'
+    + '<button class="btn btn-primary" id="mrSave" type="button" onclick="perfRetireMetric(\'' + esc(metric.metricId) + '\',' + (retired ? 'true' : 'false') + ')">'
+    + (retired ? 'Reinstate it' : 'Retire it') + '</button></div>');
+}
+
+/**
+ * The 3 new permissions said in words somebody can act on, rather than as keys.
+ * Used on My access, where a person needs to know what they are allowed to do,
+ * and on Admin, where somebody needs to know what they are granting.
+ */
+function perfCapabilityRows() {
+  var perf = BOOT.performance || {}, sites = BOOT.sites || [];
+  var where = sites.length === 0 ? 'no site yet' : (sites.length === 1 ? sites[0] : sites.length + ' sites');
+  return [
+    ['See performance for', perf.canRead ? where : 'No performance access'],
+    ['Enter monthly numbers', perf.canEnter ? 'Yes, for ' + where : 'No'],
+    ['Create and change goals', perf.canManageGoals ? 'Yes' : 'No'],
+    ['Define and retire metrics', perf.canManageMetrics ? 'Yes' : 'No'],
+    ['Correct a number after entry', perf.canEnter
+      ? (perf.canManageGoals ? 'Yes, with a reason' : 'Your own within 48 hours, then a manager approves')
+      : 'No']
+  ];
+}
+function perfCapabilityHtml() {
+  if (!BOOT.performance || !BOOT.performance.canRead) { return ''; }
+  return '<section class="card pad-lg perf" style="margin-top:16px"><h2>What you can do with performance</h2>'
+    + '<div class="explain">' + perfCapabilityRows().map(function (row) {
+      return '<div class="row"><span>' + esc(row[0]) + '</span><span>' + esc(row[1]) + '</span></div>';
+    }).join('') + '</div></section>';
+}
+
+/** The role matrix half: who holds each new permission, in plain words. */
+function perfPermissionMatrixHtml() {
+  var rows = [
+    ['performance.enter', 'Enter and correct monthly numbers', 'Site staff, regional staff, administrators'],
+    ['performance.goal.manage', 'Create, revise and retire goals', 'Regional staff and administrators'],
+    ['performance.metric.manage', 'Define and retire metrics', 'Administrators only']
+  ];
+  return '<section class="card pad-lg perf"><h2>Permissions added by the performance layer</h2>'
+    + '<p class="muted">These sit in the existing role and permission tables. No role gains anything until it is granted there.</p>'
+    + '<div class="tablewrap" style="margin-top:14px"><table><thead><tr><th>Permission</th><th>What it allows</th><th>Held by default</th></tr></thead><tbody>'
+    + rows.map(function (row) {
+      return '<tr><td><b>' + esc(row[0]) + '</b></td><td>' + esc(row[1]) + '</td><td>' + esc(row[2]) + '</td></tr>';
+    }).join('')
+    + '</tbody></table></div></section>';
+}
+
+/* ============================ data-due reminders ============================ */
+
+/**
+ * Reminders are off until somebody deliberately turns them on. A build that can
+ * email real people the moment it is installed will eventually email real
+ * people by accident, so this screen shows exactly who would be written to
+ * before anything is sent.
+ */
+function renderReminderSettings() {
+  var area = document.getElementById('remindersArea');
+  if (!area) { return; }
+  run('reminders.settings', {}).then(function (result) {
+    var target = document.getElementById('remindersArea');
+    if (!target) { return; }
+    if (!result.ok) { target.innerHTML = '<h2>Data-due reminders</h2><p class="muted">' + esc(friendly(result)) + '</p>'; return; }
+    PERF.reminders = result;
+    var rounds = result.rounds.map(function (round) {
+      return '<div class="row"><span>' + esc(round.label) + '</span><span>day ' + round.dayOfMonth + ' of the following month</span></div>';
+    }).join('');
+    target.innerHTML = '<div class="toolbar"><h2>Data-due reminders</h2>'
+      + '<button id="remToggle" class="btn ' + (result.enabled ? 'btn-ghost' : 'btn-primary') + ' btn-sm" type="button" onclick="perfToggleReminders(' + (result.enabled ? 'false' : 'true') + ')">'
+      + (result.enabled ? 'Switch reminders off' : 'Switch reminders on') + '</button></div>'
+      + '<p class="muted">' + (result.enabled
+        ? 'Reminders are on. Each month has 2 reminder rounds for authorized owners whose numbers are still missing.'
+        : 'Reminders are off. Nobody is emailed. The count beside "Enter numbers" in the sidebar still shows what is outstanding.') + '</p>'
+      + '<div class="explain">' + rounds
+      + '<div class="row"><span>Daily trigger installed</span><span>' + (result.triggers ? 'yes' : 'no') + '</span></div></div>'
+      + deliveryStatusHtml_(result.delivery)
+      + '<div class="actions" style="margin-top:14px"><button class="btn btn-ghost btn-sm" type="button" onclick="perfPreviewReminders()">Show me who would be emailed</button></div>';
+  });
+}
+
+function perfToggleReminders(enabled) {
+  var button = document.getElementById('remToggle');
+  if (button) { button.disabled = true; button.textContent = enabled ? 'Switching on...' : 'Switching off...'; }
+  run('reminders.settings', { enabled: enabled }).then(function (result) {
+    if (!result.ok) { toast(friendly(result), true); renderReminderSettings(); return; }
+    toast(enabled ? 'Reminders are on.' : 'Reminders are off. Nothing will be emailed.');
+    renderReminderSettings();
+  });
+}
+
+function perfPreviewReminders() {
+  run('reminders.preview', {}).then(function (result) {
+    if (!result.ok) { toast(friendly(result), true); return; }
+    var recipients = result.recipients.map(function (entry) {
+      var goals = entry.items.map(function (it) { return esc(it.metricName + ' at ' + it.site); }).join('; ');
+      return '<div class="rrow"><div class="rr-to">' + esc(entry.recipient) + '</div>'
+        + '<div class="rr-what">' + perfPlural(entry.items.length, 'goal', 'goals') + ': ' + goals + '</div></div>';
+    }).join('');
+    var unaddressed = result.unaddressed.length
+      ? '<div class="note" style="margin-top:14px"><span>' + perfPlural(result.unaddressed.length, 'goal has', 'goals have')
+        + ' no owner email, so nobody is reminded about ' + (result.unaddressed.length === 1 ? 'it' : 'them') + '. Add an owner email on the goal to fix that.</span></div>'
+      : '';
+    showDialog('<h2 id="dialogTitle">Reminders for ' + esc(result.periodLabel) + '</h2>'
+      + '<p class="muted">' + (result.enabled ? 'Reminders are on.' : 'Reminders are off, so none of this is sent. This is what would go out if you switched them on.') + '</p>'
+      + (recipients
+        ? '<div class="rlist">' + recipients + '</div>'
+        : '<p class="muted">Nothing is outstanding, so nobody would be emailed.</p>')
+      + unaddressed
+      + '<div class="actions" style="justify-content:flex-end;margin-top:20px">'
+      + '<button class="btn btn-primary" type="button" onclick="closeDialog()">Close</button></div>');
+  });
+}
+
+function perfRetireMetric(metricId, reinstate) {
+  var button = document.getElementById('mrSave'), seq = dialogSeq_();
+  if (button) { button.disabled = true; button.textContent = 'Saving...'; }
+  run('metric.retire', { metricId: metricId, updatedAt: PERF.retiringMetricUpdatedAt, active: reinstate, submissionKey: dialogCommandKey_() }).then(function (result) {
+    if (!result.ok) { if (button) { button.disabled = false; button.textContent = 'Retry change'; } dialogError(seq, friendly(result)); return; }
+    closeDialogIf(seq);
+    toast(reinstate ? 'Metric reinstated.' : 'Metric retired. Nothing was deleted.');
+    renderMetrics();
+  });
+}
+</script>

@@ -1,0 +1,11 @@
+{
+  "catalogVersion": 1,
+  "status": "draft-pending-runtime-integration",
+  "templates": [
+    {"id": "customer-import", "file": "customer-import.csv", "purpose": "Stage business customer records for validation before import", "activation": "Explicit administrator review"},
+    {"id": "contact-import", "file": "contact-import.csv", "purpose": "Stage business contacts linked to a customer", "activation": "Explicit administrator review"},
+    {"id": "operating-manual", "file": "operating-manual.md", "purpose": "Define maintained operating instructions", "activation": "Designated business editor approves every instruction"},
+    {"id": "monthly-review", "file": "monthly-review.md", "purpose": "Record scoped operational results and decisions", "activation": "Manager reviews the generated snapshot"},
+    {"id": "forms", "file": "forms.json", "purpose": "Specify internal intake and optional public inquiry forms", "activation": "Manual Google creation and sharing review"}
+  ]
+}

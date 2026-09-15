@@ -1,0 +1,362 @@
+<script>
+'use strict';
+/**
+ * ImproveUi.html - the Guidance surfaces.
+ *
+ * The guidance panel on a goal, the hook on a dashboard card, and the Playbook
+ * screen. The complete action lifecycle remains planned.
+ *
+ * Tests assert provenance, empty states, and health notices.
+ *
+ * Nothing here composes guidance text. The server sends stored blocks or it
+ * sends nothing, and this file renders one or says so.
+ */
+
+var IMPROVE = { playbook: null };
+
+/* ============================ small shared pieces ============================ */
+
+var ICON_BOOK_ = '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20"/>';
+
+function improveNiceDate_(iso) {
+  var text = String(iso || '').slice(0, 10);
+  var parts = text.split('-');
+  var months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  if (parts.length !== 3 || !months[Number(parts[1]) - 1]) { return text; }
+  return String(Number(parts[2])) + ' ' + months[Number(parts[1]) - 1] + ' ' + parts[0];
+}
+
+/** "12 minutes ago" reads better than a timestamp for something that just ran. */
+function improveSince_(iso) {
+  var then = new Date(String(iso || ''));
+  if (isNaN(then.getTime())) { return 'not yet'; }
+  var minutes = Math.round((Date.now() - then.getTime()) / 60000);
+  if (minutes < 1) { return 'just now'; }
+  if (minutes === 1) { return '1 minute ago'; }
+  if (minutes < 60) { return minutes + ' minutes ago'; }
+  var hours = Math.round(minutes / 60);
+  if (hours === 1) { return '1 hour ago'; }
+  if (hours < 24) { return hours + ' hours ago'; }
+  return improveNiceDate_(then.toISOString());
+}
+
+/* ============================ the hook on a dashboard card ============================ */
+
+/**
+ * The quiet line on a card that says the manual has something for this.
+ * Only ever appears where a tracked action would make sense, which is decision
+ * A4: guidance shows in every situation, but the offer to act does not.
+ */
+function improveCardHook(item) {
+  var guidance = item.guidance;
+  if (!guidance || !guidance.situation) { return ''; }
+  var status = item.result.status;
+  if (status !== 'At risk' && status !== 'Off track') { return ''; }
+  if (guidance.missing) {
+    return '<div class="gc-guide quiet">'
+      + '<svg viewBox="0 0 24 24" aria-hidden="true">' + ICON_BOOK_ + '</svg>'
+      + '<span>Playbook: no steps for this yet</span></div>';
+  }
+  var count = Number(guidance.stepCount || 0);
+  return '<button type="button" class="gc-guide" onclick="openGoalDetail(\'' + esc(item.goalId) + '\')">'
+    + '<svg viewBox="0 0 24 24" aria-hidden="true">' + ICON_BOOK_ + '</svg>'
+    + '<span>Playbook: ' + count + ' recovery step' + (count === 1 ? '' : 's') + ' ready</span></button>';
+}
+
+/* ============================ the guidance panel ============================ */
+
+/** The situation lead, filled by the status band. Gate-locked copy. */
+function improveSituationLine_(guidance) {
+  if (guidance.situation === 'sustain') { return 'This goal is on track, so the manual shows how to sustain it.'; }
+  if (guidance.situation === 'recover') { return 'This goal is at risk, so the manual shows how to recover it.'; }
+  if (guidance.situation === 'urgent') { return 'This goal is off track, so the manual shows the urgent recovery steps.'; }
+  return 'This goal has no number to judge yet, so the manual has nothing to point at.';
+}
+
+/**
+ * The gap line, shown only when the gap is large enough that the manual
+ * escalates. It states the arithmetic rather than asserting the gap is large.
+ */
+function improveGapLine_(detail) {
+  var item = detail.item, result = item.result;
+  if (result.ratio === null || result.ratio === undefined) { return ''; }
+  var line = 'Latest <b>' + esc(perfFmt(item.metricType, result.latestValue)) + '</b> against a target of <b>'
+    + esc(perfFmt(item.metricType, item.target)) + '</b>, ' + Math.round(result.ratio * 100) + '% of the line.';
+  if (result.status === 'Off track') { line += ' The gap is large, so the manual escalates to the urgent steps.'; }
+  return line;
+}
+
+function improveGuidancePanelHtml(detail) {
+  var guidance = detail.guidance || {};
+  var head = '<div class="guide-head"><div class="gh-top">'
+    + '<svg class="gh-book" viewBox="0 0 24 24" aria-hidden="true">' + ICON_BOOK_ + '</svg>'
+    + '<h3>What the playbook says</h3></div>'
+    + '<p>' + esc(improveSituationLine_(guidance))
+    + (improveGapLine_(detail) ? '<br>' + improveGapLine_(detail) : '') + '</p></div>';
+
+  var body;
+  if (guidance.missing || !guidance.blocks || !guidance.blocks.length) {
+    /* The honest empty state. It renders no ordered list at all, so there is no
+       shape on screen that could be mistaken for advice. */
+    var ask = detail.canManagePlaybook
+      ? 'Add a section for it so this never comes up blank again.'
+      : 'Ask a manager to add a section for it.';
+    body = '<div class="guide-body"><div class="note">'
+      + '<span>The manual has nothing for <b>this metric in this situation</b> yet. ' + esc(ask)
+      + ' ' + esc(BOOT.branding.productName) + ' never makes up advice, so it shows this honestly rather than inventing steps.</span></div></div>';
+  } else {
+    body = '<div class="guide-body">' + guidance.blocks.map(function (block) {
+      var local = block.scopeType !== 'organization';
+      return '<div class="gblock">'
+        + '<div class="sc' + (local ? ' local' : '') + '"><span class="mk" aria-hidden="true"></span>' + esc(block.label) + '</div>'
+        + '<ol>' + block.steps.map(function (step) { return '<li>' + esc(step) + '</li>'; }).join('') + '</ol>'
+        + '</div>';
+    }).join('') + '</div>';
+  }
+
+  /* The provenance strip renders on every panel, including the empty one. */
+  var source = guidance.docName
+    ? (canNav('playbook')
+      ? '<button type="button" class="aslink" onclick="go(\'playbook\')">' + esc(guidance.docName) + '</button>'
+      : '<span>' + esc(guidance.docName) + '</span>')
+    : '<span>your operating manual</span>';
+  /* Each separator travels with the words it introduces, so a wrap can never
+     leave a lone dot dangling at the end of a line. */
+  var prov = '<div class="prov"><span class="bit">From ' + source + '</span>'
+    + (guidance.updatedAt ? '<span class="bit"><span class="dot" aria-hidden="true"></span> updated ' + esc(improveNiceDate_(guidance.updatedAt)) + '</span>' : '')
+    + '<span class="bit"><span class="dot" aria-hidden="true"></span> shown exactly as written, nothing generated</span></div>';
+
+  return '<div class="guide">' + head + body + prov + '</div>';
+}
+
+/* ============================ the Playbook screen ============================ */
+
+function renderPlaybook() {
+  var token = perfShowSkeleton();
+  run('playbook.board', {}).then(function (result) {
+    if (!perfIsCurrent(token)) { return; }
+    if (!result.ok) { setMain('<div class="perf">' + errorHtml(friendly(result)) + '</div>'); return; }
+    IMPROVE.playbook = result;
+    perfSetMain(improvePlaybookHtml(result));
+  });
+}
+
+function improvePlaybookHtml(board) {
+  var head = '<div class="page-head"><div class="page-head-copy">'
+    + '<div class="crumb">Operating model</div>'
+    + '<h1>Playbook</h1>'
+    + '<p class="sub">Your operating manual, kept in Google Docs. The app reads it and shows the right part the moment a number needs it.</p>'
+    + '</div></div>';
+
+  if (!board.hasDoc) {
+    return head + (board.canManage
+      ? '<div class="card empty"><h3>No operating manual yet</h3>'
+        + '<p style="margin-top:8px">The app can create one for you, with a section for every metric in the library and a heading for each situation. It will not write any advice: that part is yours.</p>'
+        + '<button class="btn btn-primary" type="button" onclick="improveCreateDoc()" id="createDocBtn" style="margin-top:16px">Create the manual</button></div>'
+      : '<div class="card empty"><h3>No operating manual yet</h3>'
+        + '<p style="margin-top:8px">Nobody has set up the manual for your organization. Ask a manager to create it.</p></div>');
+  }
+
+  return head + improveHealthHtml(board) + improveDocCardHtml(board) + improveRulesNoteHtml(board)
+    + (board.sections.length
+      ? board.sections.map(improveSectionHtml).join('')
+      : '<div class="card empty"><h3>Nothing has been written yet</h3><p style="margin-top:8px">The manual has its sections and headings. Open it in Google Docs and write what your teams should do in each situation.</p></div>');
+}
+
+function improveHealthHtml(board) {
+  var health = board.health;
+  if (!health) { return ''; }
+
+  if (health.status !== 'broken') {
+    var written = Number(health.sectionCount || 0);
+    var body = written
+      ? 'All <b>' + written + ' section' + (written === 1 ? '' : 's') + '</b> read cleanly.'
+      : 'Nothing has been written into it yet, so there is nothing that can break.';
+    return '<div class="pb-health ok"><div class="hi"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></div>'
+      + '<div><div class="ht">Playbook healthy</div><div class="hs">' + body
+      + ' Checked <b>' + esc(improveSince_(health.lastCheckedAt)) + '</b>.'
+      + improveEditorLine_(health) + '</div></div></div>';
+  }
+
+  var count = Number(health.problemCount || 0);
+  var first = health.problems[0] || {};
+  var detail = count === 1
+    ? 'The heading <b>&ldquo;' + esc(first.heading) + '&rdquo;</b> ' + esc(first.explained) + ', so the app is not reading that section.'
+    : '<b>' + count + ' headings</b> are not being read: '
+      + health.problems.map(function (problem) { return '&ldquo;' + esc(problem.heading) + '&rdquo; (' + esc(problem.explained) + ')'; }).join(', ') + '.';
+  var stillServing = health.lastGoodAt
+    ? ' Until it is fixed, the app is still serving the last good version from <b>' + esc(improveNiceDate_(health.lastGoodAt)) + '</b>, so no site is left without guidance.'
+    : ' The app is still serving the last version it could read, so no site is left without guidance.';
+
+  var remind = health.lastEditorEmail
+    ? '<button class="btn btn-ghost btn-sm" type="button" id="remindBtn" onclick="improveRemindEditor()">Remind ' + esc(String(health.lastEditor || health.lastEditorEmail).split(' ')[0]) + '</button>'
+    : '';
+  return '<div class="pb-health bad"><div class="hi"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div>'
+    + '<div><div class="ht">' + count + ' section' + (count === 1 ? '' : 's') + ' can\'t be read</div>'
+    + '<div class="hs">' + detail + improveEditorLine_(health) + stillServing + '</div>'
+    + '<div class="hrow">'
+    + (board.doc && board.doc.url ? '<a class="btn btn-primary btn-sm" href="' + esc(board.doc.url) + '" target="_blank" rel="noopener">Open the Doc to fix it</a>' : '')
+    + remind
+    + '<button class="btn btn-ghost btn-sm" type="button" id="recheckBtn" onclick="improveRecheck()">Check again</button>'
+    + '</div></div></div>';
+}
+
+/** Names the person, and says where the name came from when it is not certain. */
+function improveEditorLine_(health) {
+  if (!health.lastEditor) { return ''; }
+  var when = health.lastEditedAt ? ' on ' + esc(improveNiceDate_(health.lastEditedAt)) : '';
+  var line = ' Last edited by <b>' + esc(health.lastEditor) + '</b>' + when + '.';
+  if (String(health.lastEditorSource) === 'owner-fallback') {
+    line += ' That is the document owner; the exact last editor was not available.';
+  }
+  return line;
+}
+
+function improveDocCardHtml(board) {
+  var doc = board.doc || {};
+  return '<div class="pb-doc"><div class="di"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h6"/></svg></div>'
+    + '<div class="dt"><b>' + esc(doc.name || 'Operating manual') + '</b>'
+    + '<span>Maintained in Google Docs. The app reads it and shows the right part on each goal. '
+    + (board.canManage ? 'Edit in Docs with spell-check and comments; the app keeps in step.' : 'Read-only for site staff.') + '</span></div>'
+    + (doc.url ? '<a class="btn btn-ghost btn-sm" href="' + esc(doc.url) + '" target="_blank" rel="noopener">'
+      + '<svg viewBox="0 0 24 24" aria-hidden="true" style="width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6M10 14 21 3"/></svg> Open in Docs</a>' : '')
+    + '</div>';
+}
+
+function improveRulesNoteHtml(board) {
+  if (!board.canManage) { return ''; }
+  return '<div class="note" style="border-left-color:var(--primary);margin-bottom:16px"><span>'
+    + '<b>How editing works.</b> Every section in the Doc starts with a heading shown in green. '
+    + 'That heading is what connects your advice to the app. Write freely everywhere else. '
+    + 'A checker scans the Doc a few times a day, and the moment the app reads it, and emails you if a green heading gets broken.'
+    + '</span></div>';
+}
+
+function improveSectionHtml(section, index) {
+  var broken = section.problems && section.problems.length;
+  var expanded = index === 0;
+  var blocks = section.blocks.map(function (block) {
+    var local = block.scopeType !== 'organization';
+    var label = local ? esc(block.scopeName) + ' override, ' + esc(block.situationLabel.toLowerCase()) : esc(block.situationLabel);
+    return '<div class="pb-guid"><div class="lab ' + (local ? 'local' : esc(block.situation)) + '">'
+      + '<span class="mk" aria-hidden="true"></span>' + label + '</div>'
+      + '<ol>' + block.steps.map(function (step) { return '<li>' + esc(step) + '</li>'; }).join('') + '</ol></div>';
+  }).join('');
+  var brokenNotes = (section.problems || []).map(function (problem) {
+    return '<div class="pb-broken-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>'
+      + '<span><b>&ldquo;' + esc(problem.heading) + '&rdquo;</b> ' + esc(problem.explained)
+      + ', so it is not being read. The last good version is still being served to sites.</span></div>';
+  }).join('');
+  var empty = !blocks && !brokenNotes
+    ? '<div class="pb-guid"><p class="muted-sm" style="margin:0">Nothing has been written for this metric yet.</p></div>'
+    : '';
+
+  return '<section class="pb-sec' + (expanded ? ' expanded' : '') + (broken ? ' broken' : '') + '" data-section="' + esc(section.metricId) + '">'
+    + '<button class="pb-sec-h" type="button" aria-expanded="' + (expanded ? 'true' : 'false') + '" onclick="improveToggleSection(this)">'
+    + '<span class="st"><span class="mk" aria-hidden="true"></span><b>' + esc(section.name) + '</b>'
+    + (broken ? '<small class="bad">' + section.problems.length + ' part' + (section.problems.length === 1 ? '' : 's') + ' unreadable</small>' : '')
+    + '</span>'
+    + '<svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>'
+    + '<div class="pb-sec-body">' + brokenNotes + blocks + empty + '</div></section>';
+}
+
+function improveToggleSection(button) {
+  var section = button.parentNode;
+  var open = section.classList.toggle('expanded');
+  button.setAttribute('aria-expanded', String(open));
+}
+
+/* ============================ the Playbook actions ============================ */
+
+function improveCreateDoc() {
+  var button = document.getElementById('createDocBtn');
+  if (button) { button.disabled = true; button.textContent = 'Creating...'; }
+  run('playbook.ensureDoc', {}).then(function (result) {
+    if (!result.ok) {
+      var retry = document.getElementById('createDocBtn');
+      if (retry) { retry.disabled = false; retry.textContent = 'Create the manual'; }
+      toast(friendly(result), true);
+      return;
+    }
+    IMPROVE.playbook = result;
+    toast(result.created ? 'The manual has been created. Open it in Docs and write the first section.' : 'The manual already existed.');
+    perfSetMain(improvePlaybookHtml(result));
+  });
+}
+
+function improveRecheck() {
+  var button = document.getElementById('recheckBtn');
+  if (button) { button.disabled = true; button.textContent = 'Checking...'; }
+  run('playbook.recheck', {}).then(function (result) {
+    if (!result.ok) {
+      var retry = document.getElementById('recheckBtn');
+      if (retry) { retry.disabled = false; retry.textContent = 'Check again'; }
+      toast(friendly(result), true);
+      return;
+    }
+    IMPROVE.playbook = result;
+    toast(result.health && result.health.status === 'broken' ? 'Still not readable. The last good version is still being served.' : 'The manual reads cleanly again.');
+    perfSetMain(improvePlaybookHtml(result));
+  });
+}
+
+/* ============================ the alert off switch ============================ */
+
+/**
+ * The checker always runs. Only the email it can send is switchable, and it
+ * ships off, exactly like the Performance reminders. An administrator learns one
+ * pattern rather than two.
+ */
+function renderPlaybookAlertSettings() {
+  var area = document.getElementById('playbookAlertsArea');
+  if (!area) { return; }
+  run('playbook.settings', {}).then(function (result) {
+    var target = document.getElementById('playbookAlertsArea');
+    if (!target) { return; }
+    if (!result.ok) { target.innerHTML = '<h2>Playbook alerts</h2><p class="muted">' + esc(friendly(result)) + '</p>'; return; }
+    target.innerHTML = '<div class="toolbar"><h2>Playbook alerts</h2>'
+      + '<button id="pbAlertToggle" class="btn ' + (result.enabled ? 'btn-ghost' : 'btn-primary') + ' btn-sm" type="button" onclick="improveTogglePlaybookAlerts(' + (result.enabled ? 'false' : 'true') + ')">'
+      + (result.enabled ? 'Switch alerts off' : 'Switch alerts on') + '</button></div>'
+      + '<p class="muted">' + (result.enabled
+        ? 'Alerts are on. A broken heading queues a notice for authorized manual maintainers. Repeated checks of the same break do not create another message.'
+        : 'Alerts are off. The manual is still checked and the Playbook screen still shows whether it can be read, but nobody is emailed when a heading breaks.') + '</p>'
+      + '<div class="explain">'
+      + '<div class="row"><span>The manual is checked</span><span>every ' + result.everyHours + ' hours when the checking trigger is installed, or when a maintainer selects Recheck</span></div>'
+      + '<div class="row"><span>Checking trigger installed</span><span>' + (result.triggers ? 'yes' : 'no') + '</span></div>'
+      + '<div class="row"><span>A broken heading</span><span>never reaches a site as missing guidance</span></div>'
+      + '</div>' + deliveryStatusHtml_(result.delivery);
+  });
+}
+
+function improveTogglePlaybookAlerts(enabled) {
+  var button = document.getElementById('pbAlertToggle');
+  if (button) { button.disabled = true; button.textContent = enabled ? 'Switching on...' : 'Switching off...'; }
+  run('playbook.settings', { enabled: enabled }).then(function (result) {
+    if (!result.ok) { toast(friendly(result), true); renderPlaybookAlertSettings(); return; }
+    toast(enabled ? 'Playbook alerts are on.' : 'Playbook alerts are off. The manual is still checked.');
+    renderPlaybookAlertSettings();
+  });
+}
+
+function improveRemindEditor() {
+  var button = document.getElementById('remindBtn');
+  if (button) { button.disabled = true; button.textContent = 'Sending...'; }
+  run('playbook.remind', {}).then(function (result) {
+    if (!result.ok) {
+      var retry = document.getElementById('remindBtn');
+      if (retry) { retry.disabled = false; retry.textContent = 'Remind'; }
+      toast(friendly(result), true);
+      return;
+    }
+    IMPROVE.playbook = result;
+    var delivery = result.reminded || {}, state = delivery.state;
+    var message = delivery.sent ? 'Google accepted the message to ' + delivery.recipient + '.'
+      : state === 'UNKNOWN' ? 'Delivery is unconfirmed. The message may have been sent. It will not be resent automatically.'
+      : ['PENDING', 'RETRYABLE', 'SENDING'].indexOf(state) !== -1 ? 'The message is queued. Delivery is not yet confirmed.'
+      : state === 'CANCELLED' ? 'The message was cancelled because it is no longer eligible.'
+      : 'The message could not be sent. Ask an administrator to review its delivery status.';
+    toast(message, state === 'UNKNOWN' || state === 'FAILED');
+    perfSetMain(improvePlaybookHtml(result));
+  });
+}
+</script>
